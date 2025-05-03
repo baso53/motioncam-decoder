@@ -1,19 +1,3 @@
-/*
- * Copyright 2023 MotionCam
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include <iostream>
 
 #include <motioncam/Decoder.hpp>
@@ -22,35 +6,6 @@
 #define TINY_DNG_WRITER_IMPLEMENTATION
     #include <tinydng/tiny_dng_writer.h>
 #undef TINY_DNG_WRITER_IMPLEMENTATION
-
-void writeAudio(
-    const std::string& outputPath,
-    const int sampleRateHz,
-    const int numChannels,
-    std::vector<motioncam::AudioChunk>& audioChunks)
-{
-    AudioFile<int16_t> audio;
-    
-    audio.setNumChannels(numChannels);
-    audio.setSampleRate(sampleRateHz);
-    
-    if(numChannels == 2) {
-        for(auto& x : audioChunks) {
-            for(auto i = 0; i < x.second.size(); i+=2) {
-                audio.samples[0].push_back(x.second[i]);
-                audio.samples[1].push_back(x.second[i+1]);
-            }
-        }
-    }
-    else if(numChannels == 1) {
-        for(auto& x : audioChunks) {
-            for(auto i = 0; i < x.second.size(); i++)
-                audio.samples[0].push_back(x.second[i]);
-        }
-    }
-    
-    audio.save(outputPath);
-}
 
 void writeDng(
     const std::string& outputPath,
@@ -156,21 +111,7 @@ int main(int argc, const char * argv[]) {
         
         if(endFrame < 0)
             endFrame = static_cast<int>(frames.size());
-        
-        //
-        // Write audio
-        //
-        
-        std::vector<motioncam::AudioChunk> audioChunks;
-        
-        d.loadAudio(audioChunks);
-        
-        writeAudio("audio.wav", d.audioSampleRateHz(), d.numAudioChannels(), audioChunks);
-        
-        //
-        // Write video
-        //
-        
+
         std::vector<uint16_t> data;
         nlohmann::json metadata;
         
