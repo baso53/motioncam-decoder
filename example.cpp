@@ -25,9 +25,12 @@
 static motioncam::Decoder *gDecoder = nullptr;
 static nlohmann::json gContainerMetadata;
 static std::vector<std::string> gFiles;
-static std::map<std::string, std::string> gCache; // path → packed DNG
-static std::map<std::string, size_t> gSizes;      // path → file size
+static std::map<std::string, std::string> gCache; // path → packed DNG data
 static std::mutex gCacheMutex;
+
+// Since every frame‐DNG is the same size, cache it once
+static size_t gFrameSize = 0;
+static std::mutex gFrameSizeMutex;
 
 static std::mutex gDecoderMutex;
 
@@ -40,6 +43,7 @@ static std::string frameName(int i)
 }
 
 // decode one frame into gCache[path]
+// after writing to cache, if this is the first frame, record its size
 static int load_frame(const std::string &path)
 {
     {
@@ -48,7 +52,7 @@ static int load_frame(const std::string &path)
             return 0;
     }
 
-    // find the 0-based index
+    // find zero‐based index
     int idx = -1;
     for (size_t i = 0; i < gFiles.size(); ++i)
         if (gFiles[i] == path)
@@ -59,20 +63,14 @@ static int load_frame(const std::string &path)
     if (idx < 0)
         return -ENOENT;
 
-    // This is the missing piece: fetch the real timestamp.
-    auto ts = gDecoder->getFrames()[idx];
-
-    // decode raw + meta by timestamp, not by idx
+    // decode raw + meta
     std::vector<uint16_t> raw;
     nlohmann::json meta;
-
     try
     {
         auto ts = gDecoder->getFrames()[idx];
-        {
-            std::lock_guard<std::mutex> dlk(gDecoderMutex);
-            gDecoder->loadFrame(ts, raw, meta);
-        }
+        std::lock_guard<std::mutex> dlk(gDecoderMutex);
+        gDecoder->loadFrame(ts, raw, meta);
     }
     catch (std::exception &e)
     {
@@ -80,7 +78,7 @@ static int load_frame(const std::string &path)
         return -EIO;
     }
 
-    // pack into in-memory DNG
+    // pack into in‐memory DNG (exactly as before)…
     tinydngwriter::DNGImage dng;
     dng.SetSubfileType(false, false, false);
     dng.SetCompression(tinydngwriter::COMPRESSION_NONE);
@@ -94,28 +92,23 @@ static int load_frame(const std::string &path)
     dng.SetImageLength(h);
     dng.SetImageData(
         (const unsigned char *)raw.data(),
-        raw.size() // ← byte count, not sample count
-    );
+        raw.size());
     dng.SetPlanarConfig(tinydngwriter::PLANARCONFIG_CONTIG);
     dng.SetPhotometric(tinydngwriter::PHOTOMETRIC_CFA);
-    dng.SetRowsPerStrip(h);
     dng.SetSamplesPerPixel(1);
     dng.SetCFARepeatPatternDim(2, 2);
 
-    // black/white level
+    // Black/white levels, CFA, bits, matrices, etc… (same as your code)
     {
         std::vector<double> blackD = gContainerMetadata["blackLevel"];
         std::vector<uint16_t> blackU(blackD.size());
         for (size_t i = 0; i < blackD.size(); i++)
-            blackU[i] = uint16_t(std::round(blackD[i]));
+            blackU[i] = uint16_t(std::lround(blackD[i]));
         dng.SetBlackLevelRepeatDim(2, 2);
         dng.SetBlackLevel(uint32_t(blackU.size()), blackU.data());
-
         double whiteLevel = gContainerMetadata["whiteLevel"];
         dng.SetWhiteLevelRational(1, &whiteLevel);
     }
-
-    // CFA pattern
     {
         std::string sa = gContainerMetadata["sensorArrangment"];
         uint8_t cfa[4] = {0, 0, 0, 0};
@@ -150,12 +143,10 @@ static int load_frame(const std::string &path)
         dng.SetCFAPattern(4, cfa);
         dng.SetCFALayout(1);
     }
-    // bits per sample
     {
         uint16_t bps[1] = {16};
         dng.SetBitsPerSample(1, bps);
     }
-    // color matrices
     {
         auto cm1 = gContainerMetadata["colorMatrix1"].get<std::vector<double>>();
         auto cm2 = gContainerMetadata["colorMatrix2"].get<std::vector<double>>();
@@ -166,30 +157,19 @@ static int load_frame(const std::string &path)
         dng.SetForwardMatrix1(3, fm1.data());
         dng.SetForwardMatrix2(3, fm2.data());
     }
-    // asShotNeutral
     {
         auto asShot = meta["asShotNeutral"].get<std::vector<double>>();
         dng.SetAsShotNeutral(3, asShot.data());
     }
-    // active area
     {
         uint32_t activeArea[4] = {0, 0, h, w};
         dng.SetActiveArea(activeArea);
     }
-
     if (gContainerMetadata.contains("software"))
-    {
-        std::string sw = gContainerMetadata["software"];
-        dng.SetSoftware(sw.c_str());
-    }
-
+        dng.SetSoftware(gContainerMetadata["software"].get<std::string>().c_str());
     if (gContainerMetadata.contains("orientation"))
-    {
-        // Exif orientation codes 1–8; e.g. “Rotate 90 CW”→6
         dng.SetOrientation(uint16_t(gContainerMetadata["orientation"].get<int>()));
-    }
 
-    // write into stringstream
     tinydngwriter::DNGWriter writer(false);
     writer.AddImage(&dng);
     std::ostringstream oss;
@@ -205,11 +185,22 @@ static int load_frame(const std::string &path)
         std::lock_guard<std::mutex> lk(gCacheMutex);
         gCache[path] = oss.str();
     }
+
+    // record the global frame size if first time
+    {
+        std::lock_guard<std::mutex> lk(gFrameSizeMutex);
+        if (gFrameSize == 0)
+        {
+            std::lock_guard<std::mutex> ckl(gCacheMutex);
+            gFrameSize = gCache[path].size();
+        }
+    }
+
     return 0;
 }
 
 //------------------------------------------------------------------------------
-// ATTR: report size=0 until opened
+// ATTR: report uniform size (0 until we have it)
 static int fs_getattr(const char *path, struct stat *st)
 {
     memset(st, 0, sizeof(*st));
@@ -226,8 +217,10 @@ static int fs_getattr(const char *path, struct stat *st)
 
     st->st_mode = S_IFREG | 0444;
     st->st_nlink = 1;
-    auto sit = gSizes.find(fn);
-    st->st_size = (sit == gSizes.end() ? 0 : sit->second);
+    {
+        std::lock_guard<std::mutex> lk(gFrameSizeMutex);
+        st->st_size = (off_t)gFrameSize;
+    }
     return 0;
 }
 
@@ -260,7 +253,7 @@ static int fs_releasedir(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
-// OPEN: do the heavy work this one time
+// OPEN: do the heavy work once per file
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
     std::string fn = path + 1;
@@ -269,15 +262,12 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
     if ((fi->flags & 3) != O_RDONLY)
         return -EACCES;
 
+    // decode if needed
     int err = load_frame(fn);
     if (err < 0)
         return err;
 
-    // record true size
-    {
-        std::lock_guard<std::mutex> lk(gCacheMutex);
-        gSizes[fn] = gCache[fn].size();
-    }
+    // no per-file size map anymore
     return 0;
 }
 
@@ -295,7 +285,7 @@ static int fs_read(const char *path,
     if (it == gCache.end())
         return -ENOENT;
 
-    const auto &data = it->second;
+    auto &data = it->second;
     if ((size_t)offset >= data.size())
         return 0;
     size_t tocopy = std::min<size_t>(size, data.size() - (size_t)offset);
@@ -356,20 +346,30 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // fill file list & container metadata
+    // 2) build file list & grab metadata
     auto frames = gDecoder->getFrames();
     gContainerMetadata = gDecoder->getContainerMetadata();
     std::cerr << "DEBUG: found " << frames.size() << " frames\n";
     for (size_t i = 0; i < frames.size(); ++i)
         gFiles.push_back(frameName(int(i)));
 
-    // build FUSE args (foreground + auto_cache)
+    // 3) pre‐warm the first frame so that gFrameSize is set
+    if (!gFiles.empty())
+    {
+        if (int err = load_frame(gFiles[0]) < 0)
+        {
+            std::cerr << "Failed to load first frame: " << err << "\n";
+            return 1;
+        }
+    }
+
+    // 4) run FUSE
     int fuse_argc = 5;
     char *fuse_argv[6];
     fuse_argv[0] = argv[0];
     fuse_argv[1] = (char *)"-f";
     fuse_argv[2] = (char *)"-o";
-    fuse_argv[3] = (char *)"auto_cache";
+    fuse_argv[3] = (char *)"auto_cache,noappledouble,nobrowse";
     fuse_argv[4] = argv[2];
     fuse_argv[5] = nullptr;
 
