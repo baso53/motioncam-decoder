@@ -1906,65 +1906,117 @@ DNGWriter::DNGWriter(bool big_endian) : dng_big_endian_(big_endian) {
   swap_endian_ = (IsBigEndian() != dng_big_endian_);
 }
 
-// in tiny_dng_writer.h, next to WriteToFile(...)
 bool DNGWriter::WriteToStream(std::ostream &ofs, std::string *err) const {
-  // this is essentially the same as WriteToFile, but writes
-  // into any ostream instead of a file.
-  std::ostringstream header;
-  if (!WriteTIFFVersionHeader(&header, dng_big_endian_)) {
+  // 0) Preserve & extend the stream’s exception mask
+  auto old_excepts = ofs.exceptions();
+  ofs.exceptions(old_excepts | std::ios::badbit | std::ios::failbit);
+
+  // 1) Build the fixed-length TIFF/DNG header into an ostringstream
+  std::ostringstream hdr_builder;
+  if (!WriteTIFFVersionHeader(&hdr_builder, dng_big_endian_)) {
     if (err) *err = "Failed to write TIFF version header.\n";
+    ofs.exceptions(old_excepts);
     return false;
   }
+
   if (images_.empty()) {
     if (err) *err = "No image added for writing.\n";
+    ofs.exceptions(old_excepts);
     return false;
   }
-  // 1) compute data offsets
+
+  // 2) Compute data offsets for each image
   size_t data_len = 0;
-  std::vector<size_t> data_offset_table, strip_offset_table;
+  std::vector<size_t> data_offset_table;
+  std::vector<size_t> strip_offset_table;
+  data_offset_table.reserve(images_.size());
+  strip_offset_table.reserve(images_.size());
+
   for (auto &img : images_) {
     strip_offset_table.push_back(data_len + img->GetStripOffset());
     data_offset_table.push_back(data_len);
     data_len += img->GetDataSize();
   }
-  // 2) IFD offset = header + data_len:
+
+  // 3) Compute and write the IFD-offset into the header
   unsigned int ifd_offset = static_cast<unsigned int>(kHeaderSize + data_len);
-  Write4(ifd_offset, &header, swap_endian_);
-  // header.str().length() must == kHeaderSize
-  ofs.write(header.str().c_str(),
-            static_cast<std::streamsize>(header.str().length()));
-  // 3) write image data
+  Write4(ifd_offset, &hdr_builder, swap_endian_);
+
+  // 4) Extract the header buffer exactly once
+  std::string header = hdr_builder.str();
+  if (header.size() != kHeaderSize) {
+    if (err) *err = "Internal error: constructed header length != kHeaderSize\n";
+    ofs.exceptions(old_excepts);
+    return false;
+  }
+
+  // 5) Write the header to the output stream
+  try {
+    ofs.write(header.data(),
+              static_cast<std::streamsize>(header.size()));
+  }
+  catch (const std::exception &ex) {
+    if (err) *err = std::string("Failed to write header: ") + ex.what() + "\n";
+    ofs.exceptions(old_excepts);
+    return false;
+  }
+
+  // 6) Write each image’s raw data
   for (size_t i = 0; i < images_.size(); ++i) {
     if (!images_[i]->WriteDataToStream(&ofs)) {
       if (err) {
-        std::stringstream ss;
-        ss << "Failed to write data[" << i
+        std::ostringstream ss;
+        ss << "Failed to write image data[" << i
            << "], err=" << images_[i]->Error() << "\n";
-        *err += ss.str();
+        *err = ss.str();
       }
+      ofs.exceptions(old_excepts);
       return false;
     }
   }
-  // 4) write IFDs
+
+  // 7) Write each IFD and its “next-IFD” pointer
   for (size_t i = 0; i < images_.size(); ++i) {
     if (!images_[i]->WriteIFDToStream(
            static_cast<unsigned int>(data_offset_table[i]),
-           static_cast<unsigned int>(strip_offset_table[i]), &ofs))
+           static_cast<unsigned int>(strip_offset_table[i]),
+           &ofs))
     {
       if (err) {
-        std::stringstream ss;
+        std::ostringstream ss;
         ss << "Failed to write IFD[" << i
            << "], err=" << images_[i]->Error() << "\n";
-        *err += ss.str();
+        *err = ss.str();
       }
+      ofs.exceptions(old_excepts);
       return false;
     }
-    // next IFD pointer
-    unsigned int next_ifd = (i + 1 == images_.size()) ? 0
-        : static_cast<unsigned int>(ofs.tellp()) + sizeof(unsigned int);
-    if (swap_endian_) swap4(&next_ifd);
-    ofs.write(reinterpret_cast<const char*>(&next_ifd), 4);
+
+    // compute & write pointer to the next IFD
+    unsigned int next_ifd = (i + 1 == images_.size())
+                              ? 0
+                              : static_cast<unsigned int>(ofs.tellp()) + sizeof(unsigned int);
+    if (swap_endian_) {
+      swap4(&next_ifd);
+    }
+
+    try {
+      ofs.write(reinterpret_cast<const char*>(&next_ifd), sizeof(next_ifd));
+    }
+    catch (const std::exception &ex) {
+      if (err) {
+        std::ostringstream ss;
+        ss << "Failed to write next-IFD pointer after IFD[" << i
+           << "]: " << ex.what() << "\n";
+        *err = ss.str();
+      }
+      ofs.exceptions(old_excepts);
+      return false;
+    }
   }
+
+  // 8) Restore the old exception mask and succeed
+  ofs.exceptions(old_excepts);
   return true;
 }
 

@@ -1,4 +1,4 @@
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 29
 
 #include <fuse.h>
 #include <cstring>
@@ -29,6 +29,8 @@ static std::map<std::string, std::string> gCache; // path → packed DNG
 static std::map<std::string, size_t> gSizes;      // path → file size
 static std::mutex gCacheMutex;
 
+static std::mutex gDecoderMutex;
+
 // builds "frame_%06d.dng"
 static std::string frameName(int i)
 {
@@ -43,29 +45,38 @@ static int load_frame(const std::string &path)
     {
         std::lock_guard<std::mutex> lk(gCacheMutex);
         if (gCache.count(path))
-            return 0; // already loaded
+            return 0;
     }
 
-    // find index
+    // find the 0-based index
     int idx = -1;
     for (size_t i = 0; i < gFiles.size(); ++i)
         if (gFiles[i] == path)
         {
-            idx = int(i);
+            idx = (int)i;
             break;
         }
     if (idx < 0)
         return -ENOENT;
 
-    // decode raw + meta
+    // This is the missing piece: fetch the real timestamp.
+    auto ts = gDecoder->getFrames()[idx];
+
+    // decode raw + meta by timestamp, not by idx
     std::vector<uint16_t> raw;
     nlohmann::json meta;
+
     try
     {
-        gDecoder->loadFrame(idx, raw, meta);
+        auto ts = gDecoder->getFrames()[idx];
+        {
+            std::lock_guard<std::mutex> dlk(gDecoderMutex);
+            gDecoder->loadFrame(ts, raw, meta);
+        }
     }
-    catch (...)
+    catch (std::exception &e)
     {
+        std::cerr << "EIO error: " << e.what() << "\n";
         return -EIO;
     }
 
@@ -78,7 +89,10 @@ static int load_frame(const std::string &path)
     unsigned w = meta["width"], h = meta["height"];
     dng.SetImageWidth(w);
     dng.SetImageLength(h);
-    dng.SetImageData((const unsigned char *)raw.data(), raw.size());
+    dng.SetImageData(
+        (const unsigned char *)raw.data(),
+        raw.size() * sizeof(raw[0]) // ← byte count, not sample count
+    );
     dng.SetPlanarConfig(tinydngwriter::PLANARCONFIG_CONTIG);
     dng.SetPhotometric(tinydngwriter::PHOTOMETRIC_CFA);
     dng.SetRowsPerStrip(h);
