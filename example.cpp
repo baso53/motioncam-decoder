@@ -82,16 +82,19 @@ static int load_frame(const std::string &path)
 
     // pack into in-memory DNG
     tinydngwriter::DNGImage dng;
+    dng.SetSubfileType(false, false, false);
+    dng.SetCompression(tinydngwriter::COMPRESSION_NONE);
     dng.SetBigEndian(false);
-    dng.SetDNGVersion(0, 0, 4, 1);
-    dng.SetDNGBackwardVersion(0, 0, 1, 1);
+    dng.SetDNGVersion(1, 4, 0, 0);
+    dng.SetDNGBackwardVersion(1, 3, 0, 0);
 
     unsigned w = meta["width"], h = meta["height"];
+    dng.SetRowsPerStrip(h);
     dng.SetImageWidth(w);
     dng.SetImageLength(h);
     dng.SetImageData(
         (const unsigned char *)raw.data(),
-        raw.size() * sizeof(raw[0]) // ← byte count, not sample count
+        raw.size() // ← byte count, not sample count
     );
     dng.SetPlanarConfig(tinydngwriter::PLANARCONFIG_CONTIG);
     dng.SetPhotometric(tinydngwriter::PHOTOMETRIC_CFA);
@@ -101,12 +104,17 @@ static int load_frame(const std::string &path)
 
     // black/white level
     {
-        auto black = gContainerMetadata["blackLevel"].get<std::vector<uint16_t>>();
+        std::vector<double> blackD = gContainerMetadata["blackLevel"];
+        std::vector<uint16_t> blackU(blackD.size());
+        for (size_t i = 0; i < blackD.size(); i++)
+            blackU[i] = uint16_t(std::round(blackD[i]));
         dng.SetBlackLevelRepeatDim(2, 2);
-        dng.SetBlackLevel(4, black.data());
-        double wl = gContainerMetadata["whiteLevel"];
-        dng.SetWhiteLevelRational(1, &wl);
+        dng.SetBlackLevel(uint32_t(blackU.size()), blackU.data());
+
+        double whiteLevel = gContainerMetadata["whiteLevel"];
+        dng.SetWhiteLevelRational(1, &whiteLevel);
     }
+
     // CFA pattern
     {
         std::string sa = gContainerMetadata["sensorArrangment"];
@@ -165,8 +173,20 @@ static int load_frame(const std::string &path)
     }
     // active area
     {
-        uint32_t aa[4] = {0, 0, (uint32_t)h, (uint32_t)w};
-        dng.SetActiveArea(aa);
+        uint32_t activeArea[4] = {0, 0, h, w};
+        dng.SetActiveArea(activeArea);
+    }
+
+    if (gContainerMetadata.contains("software"))
+    {
+        std::string sw = gContainerMetadata["software"];
+        dng.SetSoftware(sw.c_str());
+    }
+
+    if (gContainerMetadata.contains("orientation"))
+    {
+        // Exif orientation codes 1–8; e.g. “Rotate 90 CW”→6
+        dng.SetOrientation(uint16_t(gContainerMetadata["orientation"].get<int>()));
     }
 
     // write into stringstream
