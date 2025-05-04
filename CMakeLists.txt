@@ -8,11 +8,12 @@ project(
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Add this line to fix the fuse.h error
+add_compile_definitions(_FILE_OFFSET_BITS=64)
+
 # ---------------------------------------------------------------
 # 1) Tell pkg-config where to look for .pc files
 # ---------------------------------------------------------------
-# (optional if your environment already has it,
-#  but safe to force it here)
 set(ENV{PKG_CONFIG_PATH}
     "/usr/local/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 
@@ -22,7 +23,6 @@ set(ENV{PKG_CONFIG_PATH}
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBFUSE2 REQUIRED fuse)
 
-# include- and link-directories provided by pkg-config
 include_directories(
   motioncam_decoder
   lib/include
@@ -48,7 +48,6 @@ set_property(TARGET motioncam_decoder
 # ---------------------------------------------------------------
 add_executable(example example.cpp)
 
-# link motioncam_decoder and libfuse2
 target_link_libraries(example
   PRIVATE
     motioncam_decoder
