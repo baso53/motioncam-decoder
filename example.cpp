@@ -27,7 +27,7 @@ static nlohmann::json gContainerMetadata;
 static std::vector<std::string> gFiles;
 static std::map<std::string, std::string> gCache;
 static std::mutex gCacheMutex;
-static const size_t kMaxCacheFrames = 24;
+static const size_t kMaxCacheFrames = 10;
 static std::deque<std::string> gCacheOrder;
 static size_t gFrameSize = 0;
 static std::mutex gFrameSizeMutex;
@@ -290,47 +290,47 @@ static int fs_releasedir(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
-// OPEN: do the heavy work once per file
+// OPEN: just sanity‐check, no heavy lifting any more
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
-    std::cout << "fs_open";
-    std::cout << path;
-    std::cout << "\n";
+    std::cout << "fs_open" << path << "\n";
     std::string fn = path + 1;
     if (std::find(gFiles.begin(), gFiles.end(), fn) == gFiles.end())
         return -ENOENT;
     if ((fi->flags & 3) != O_RDONLY)
         return -EACCES;
 
-    // decode if needed
-    int err = load_frame(fn);
-    if (err < 0)
-        return err;
-
-    // no per-file size map anymore
+    // NB: no load_frame() here any more!
     return 0;
 }
 
-// READ: copy from in‐memory buffer
+// READ: do the expensive decoding here, once per file
 static int fs_read(const char *path,
                    char *buf,
                    size_t size,
                    off_t offset,
                    struct fuse_file_info *fi)
 {
-    std::cout << "fs_read";
-    std::cout << path;
-    std::cout << "\n";
     (void)fi;
+    std::cout << "fs_read" << path << "\n";
+
     std::string fn = path + 1;
+
+    // 1) trigger the lazy‐decode if we haven't already cached it
+    int err = load_frame(fn);
+    if (err < 0)
+        return err;
+
+    // 2) we know it's in gCache now; copy out the bytes
     std::lock_guard<std::mutex> lk(gCacheMutex);
     auto it = gCache.find(fn);
     if (it == gCache.end())
-        return -ENOENT;
+        return -ENOENT; // should never happen, load_frame just inserted it
 
-    auto &data = it->second;
+    const std::string &data = it->second;
     if ((size_t)offset >= data.size())
         return 0;
+
     size_t tocopy = std::min<size_t>(size, data.size() - (size_t)offset);
     memcpy(buf, data.data() + offset, tocopy);
     return (ssize_t)tocopy;
