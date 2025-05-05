@@ -1,43 +1,99 @@
 #define FUSE_USE_VERSION 29
 
 #include <fuse.h>
-#include <cstring>
-#include <cerrno>
-#include <mutex>
-#include <map>
 #include <vector>
 #include <string>
+#include <map>
+#include <deque>
+#include <mutex>
+#include <algorithm>
 #include <sstream>
 #include <iostream>
-#include <algorithm>
-#include <unistd.h>      // for W_OK, X_OK, etc
-#include <sys/statvfs.h> // for struct statvfs in statfs callback
+#include <cmath>
+#include <unistd.h>
+#include <sys/statvfs.h>
 
+#include <nlohmann/json.hpp>
 #include <motioncam/Decoder.hpp>
 #include <nlohmann/json.hpp>
 
 // tiny-dng-writer…
 #define TINY_DNG_WRITER_IMPLEMENTATION
 #include <tinydng/tiny_dng_writer.h>
-#undef TINY_DNG_WRITER_IMPLEMENTATION
 
-// globals
+// … your other globals …
 static motioncam::Decoder *gDecoder = nullptr;
 static nlohmann::json gContainerMetadata;
 static std::vector<std::string> gFiles;
-static std::map<std::string, std::string> gCache; // path → packed DNG data
+static std::map<std::string, std::string> gCache;
 static std::mutex gCacheMutex;
-static const size_t kMaxCacheFrames = 10;
-static std::deque<std::string> gCacheOrder; // FIFO list of cache keys
-
-// Since every frame‐DNG is the same size, cache it once
+static const size_t kMaxCacheFrames = 24;
+static std::deque<std::string> gCacheOrder;
 static size_t gFrameSize = 0;
 static std::mutex gFrameSizeMutex;
-
 static std::mutex gDecoderMutex;
-static std::vector<motioncam::Timestamp> gFrameList; // <-- cached frame timestamps
+static std::vector<motioncam::Timestamp> gFrameList;
 
-// builds "frame_%06d.dng"
+// ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+// NEW: Container‐metadata cache
+static std::vector<uint16_t> gBlackLevels;
+static double gWhiteLevel = 0.0;
+static std::array<uint8_t, 4> gCFAPattern = {{0, 1, 1, 2}};
+static bool gHasSoftware = false;
+static std::string gSoftware;
+static bool gHasOrientation = false;
+static uint16_t gOrientation = 1;
+static std::vector<double> gColorMatrix1,
+    gColorMatrix2,
+    gForwardMatrix1,
+    gForwardMatrix2;
+
+// call this once, right after gContainerMetadata is set:
+static void cache_container_metadata()
+{
+    // Black levels
+    auto blackD = gContainerMetadata["blackLevel"].get<std::vector<double>>();
+    gBlackLevels.clear();
+    gBlackLevels.reserve(blackD.size());
+    for (double v : blackD)
+        gBlackLevels.push_back(uint16_t(std::lround(v)));
+
+    // White level
+    gWhiteLevel = gContainerMetadata["whiteLevel"].get<double>();
+
+    // CFA pattern
+    std::string sa = gContainerMetadata["sensorArrangment"].get<std::string>();
+    if (sa == "rggb")
+        gCFAPattern = {{0, 1, 1, 2}};
+    else if (sa == "bggr")
+        gCFAPattern = {{2, 1, 1, 0}};
+    else if (sa == "grbg")
+        gCFAPattern = {{1, 0, 2, 1}};
+    else if (sa == "gbrg")
+        gCFAPattern = {{1, 2, 0, 1}};
+    else
+        gCFAPattern = {{0, 1, 1, 2}};
+
+    // Software & orientation (optional)
+    if (gContainerMetadata.contains("software"))
+    {
+        gSoftware = gContainerMetadata["software"].get<std::string>();
+        gHasSoftware = true;
+    }
+    if (gContainerMetadata.contains("orientation"))
+    {
+        gOrientation = uint16_t(gContainerMetadata["orientation"].get<int>());
+        gHasOrientation = true;
+    }
+
+    // Color/forward matrices
+    gColorMatrix1 = gContainerMetadata["colorMatrix1"].get<std::vector<double>>();
+    gColorMatrix2 = gContainerMetadata["colorMatrix2"].get<std::vector<double>>();
+    gForwardMatrix1 = gContainerMetadata["forwardMatrix1"].get<std::vector<double>>();
+    gForwardMatrix2 = gContainerMetadata["forwardMatrix2"].get<std::vector<double>>();
+}
+
+// ––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
 static std::string frameName(int i)
 {
     char buf[32];
@@ -49,24 +105,24 @@ static std::string frameName(int i)
 // after writing to cache, if this is the first frame, record its size
 static int load_frame(const std::string &path)
 {
-    {
+    { // fast‐path if cached
         std::lock_guard<std::mutex> lk(gCacheMutex);
         if (gCache.count(path))
             return 0;
     }
 
-    // find zero‐based index
+    // find the frame index …
     int idx = -1;
     for (size_t i = 0; i < gFiles.size(); ++i)
         if (gFiles[i] == path)
         {
-            idx = (int)i;
+            idx = int(i);
             break;
         }
     if (idx < 0)
         return -ENOENT;
 
-    // decode raw + meta
+    // decode raw + per‐frame metadata
     std::vector<uint16_t> raw;
     nlohmann::json meta;
     try
@@ -81,7 +137,7 @@ static int load_frame(const std::string &path)
         return -EIO;
     }
 
-    // pack into in‐memory DNG (exactly as before)…
+    // pack into a DNGImage
     tinydngwriter::DNGImage dng;
     dng.SetSubfileType(false, false, false);
     dng.SetCompression(tinydngwriter::COMPRESSION_NONE);
@@ -101,78 +157,42 @@ static int load_frame(const std::string &path)
     dng.SetSamplesPerPixel(1);
     dng.SetCFARepeatPatternDim(2, 2);
 
-    // Black/white levels, CFA, bits, matrices, etc… (same as your code)
-    {
-        std::vector<double> blackD = gContainerMetadata["blackLevel"];
-        std::vector<uint16_t> blackU(blackD.size());
-        for (size_t i = 0; i < blackD.size(); i++)
-            blackU[i] = uint16_t(std::lround(blackD[i]));
-        dng.SetBlackLevelRepeatDim(2, 2);
-        dng.SetBlackLevel(uint32_t(blackU.size()), blackU.data());
-        double whiteLevel = gContainerMetadata["whiteLevel"];
-        dng.SetWhiteLevelRational(1, &whiteLevel);
-    }
-    {
-        std::string sa = gContainerMetadata["sensorArrangment"];
-        uint8_t cfa[4] = {0, 0, 0, 0};
-        if (sa == "rggb")
-        {
-            cfa[0] = 0;
-            cfa[1] = 1;
-            cfa[2] = 1;
-            cfa[3] = 2;
-        }
-        else if (sa == "bggr")
-        {
-            cfa[0] = 2;
-            cfa[1] = 1;
-            cfa[2] = 1;
-            cfa[3] = 0;
-        }
-        else if (sa == "grbg")
-        {
-            cfa[0] = 1;
-            cfa[1] = 0;
-            cfa[2] = 2;
-            cfa[3] = 1;
-        }
-        else if (sa == "gbrg")
-        {
-            cfa[0] = 1;
-            cfa[1] = 2;
-            cfa[2] = 0;
-            cfa[3] = 1;
-        }
-        dng.SetCFAPattern(4, cfa);
-        dng.SetCFALayout(1);
-    }
+    // — use *cached* container‐metadata here —
+    dng.SetBlackLevelRepeatDim(2, 2);
+    dng.SetBlackLevel(uint32_t(gBlackLevels.size()), gBlackLevels.data());
+    dng.SetWhiteLevelRational(1, &gWhiteLevel);
+
+    dng.SetCFAPattern(4, gCFAPattern.data());
+    dng.SetCFALayout(1);
+
     {
         uint16_t bps[1] = {16};
         dng.SetBitsPerSample(1, bps);
     }
-    {
-        auto cm1 = gContainerMetadata["colorMatrix1"].get<std::vector<double>>();
-        auto cm2 = gContainerMetadata["colorMatrix2"].get<std::vector<double>>();
-        auto fm1 = gContainerMetadata["forwardMatrix1"].get<std::vector<double>>();
-        auto fm2 = gContainerMetadata["forwardMatrix2"].get<std::vector<double>>();
-        dng.SetColorMatrix1(3, cm1.data());
-        dng.SetColorMatrix2(3, cm2.data());
-        dng.SetForwardMatrix1(3, fm1.data());
-        dng.SetForwardMatrix2(3, fm2.data());
-    }
+
+    dng.SetColorMatrix1(3, gColorMatrix1.data());
+    dng.SetColorMatrix2(3, gColorMatrix2.data());
+    dng.SetForwardMatrix1(3, gForwardMatrix1.data());
+    dng.SetForwardMatrix2(3, gForwardMatrix2.data());
+
+    // per‐frame white balance
     {
         auto asShot = meta["asShotNeutral"].get<std::vector<double>>();
         dng.SetAsShotNeutral(3, asShot.data());
     }
+
+    // active area
     {
         uint32_t activeArea[4] = {0, 0, h, w};
         dng.SetActiveArea(activeArea);
     }
-    if (gContainerMetadata.contains("software"))
-        dng.SetSoftware(gContainerMetadata["software"].get<std::string>().c_str());
-    if (gContainerMetadata.contains("orientation"))
-        dng.SetOrientation(uint16_t(gContainerMetadata["orientation"].get<int>()));
 
+    if (gHasSoftware)
+        dng.SetSoftware(gSoftware.c_str());
+    if (gHasOrientation)
+        dng.SetOrientation(gOrientation);
+
+    // write into an ostringstream
     tinydngwriter::DNGWriter writer(false);
     writer.AddImage(&dng);
     std::ostringstream oss;
@@ -183,29 +203,24 @@ static int load_frame(const std::string &path)
         return -EIO;
     }
 
-    // store in cache (rolling buffer)
+    // insert into rolling‐buffer cache
     {
         std::lock_guard<std::mutex> lk(gCacheMutex);
-
-        // if we're at max capacity, evict the oldest
         if (gCache.size() >= kMaxCacheFrames)
         {
-            const std::string &oldKey = gCacheOrder.front();
+            gCache.erase(gCacheOrder.front());
             gCacheOrder.pop_front();
-            gCache.erase(oldKey);
         }
-
-        // insert the new frame
         gCache[path] = oss.str();
         gCacheOrder.push_back(path);
     }
 
-    // record the global frame size if first time
+    // record frame‐size once
     {
         std::lock_guard<std::mutex> lk(gFrameSizeMutex);
         if (gFrameSize == 0)
         {
-            std::lock_guard<std::mutex> ckl(gCacheMutex);
+            std::lock_guard<std::mutex> lk2(gCacheMutex);
             gFrameSize = gCache[path].size();
         }
     }
@@ -380,14 +395,18 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // 2) build file list & grab metadata
+    // 2) grab all frame‐timestamps + container‐metadata
     gFrameList = gDecoder->getFrames();
     gContainerMetadata = gDecoder->getContainerMetadata();
+
+    // 2b) cache and discard the JSON lookups
+    cache_container_metadata();
+
     std::cerr << "DEBUG: found " << gFrameList.size() << " frames\n";
     for (size_t i = 0; i < gFrameList.size(); ++i)
         gFiles.push_back(frameName(int(i)));
 
-    // 3) pre‐warm the first frame so that gFrameSize is set
+    // 3) pre‐warm first frame so gFrameSize is set
     if (!gFiles.empty())
     {
         if (int err = load_frame(gFiles[0]); err < 0)
