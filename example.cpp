@@ -12,6 +12,10 @@
 #include <cmath>
 #include <unistd.h>
 #include <sys/statvfs.h>
+#include <cstring>    // for strdup, strerror
+#include <libgen.h>   // for dirname(), basename()
+#include <sys/stat.h> // for mkdir
+#include <errno.h>
 
 #include <nlohmann/json.hpp>
 #include <motioncam/Decoder.hpp>
@@ -374,20 +378,48 @@ static struct fuse_operations fs_ops = {
     .open = fs_open,
     .read = fs_read,
 };
-
 int main(int argc, char *argv[])
 {
-    if (argc != 3)
+    if (argc != 2)
     {
         std::cerr << "Usage: " << argv[0]
-                  << " <input.motioncam> <mountpoint>\n";
+                  << " <input.motioncam>\n";
         return 1;
     }
 
-    // 1) open decoder
+    // 1) figure out mount‐point directory: same folder, same basename (no .motioncam)
+    std::string inputPath = argv[1];
+    // make writable copies for dirname()/basename()
+    char *dup1 = strdup(inputPath.c_str());
+    char *dup2 = strdup(inputPath.c_str());
+
+    std::string parentDir = dirname(dup1); // e.g. "/foo/bar"
+    std::string fileName = basename(dup2); // e.g. "video.motioncam"
+
+    free(dup1);
+    free(dup2);
+
+    // strip extension from filename
+    std::string base = fileName;
+    auto dot = base.rfind('.');
+    if (dot != std::string::npos)
+        base.erase(dot);
+
+    // assemble mount‐point path
+    std::string mountPoint = parentDir + "/" + base;
+
+    // create the directory if it doesn't exist
+    if (::mkdir(mountPoint.c_str(), 0755) != 0 && errno != EEXIST)
+    {
+        std::cerr << "Error creating mountpoint '" << mountPoint
+                  << "': " << strerror(errno) << "\n";
+        return 1;
+    }
+
+    // 2) open decoder
     try
     {
-        gDecoder = new motioncam::Decoder(argv[1]);
+        gDecoder = new motioncam::Decoder(inputPath);
     }
     catch (std::exception &e)
     {
@@ -395,18 +427,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // 2) grab all frame‐timestamps + container‐metadata
+    // 3) preload metadata & frame‐list
     gFrameList = gDecoder->getFrames();
     gContainerMetadata = gDecoder->getContainerMetadata();
-
-    // 2b) cache and discard the JSON lookups
     cache_container_metadata();
 
     std::cerr << "DEBUG: found " << gFrameList.size() << " frames\n";
     for (size_t i = 0; i < gFrameList.size(); ++i)
         gFiles.push_back(frameName(int(i)));
 
-    // 3) pre‐warm first frame so gFrameSize is set
+    // 4) warm up first frame so gFrameSize is known
     if (!gFiles.empty())
     {
         if (int err = load_frame(gFiles[0]); err < 0)
@@ -416,14 +446,17 @@ int main(int argc, char *argv[])
         }
     }
 
-    // 4) run FUSE
+    // 5) build FUSE argv and run
     int fuse_argc = 5;
     char *fuse_argv[6];
     fuse_argv[0] = argv[0];
     fuse_argv[1] = (char *)"-f";
     fuse_argv[2] = (char *)"-o";
-    fuse_argv[3] = (char *)"noappledouble,nobrowse,noappledouble,noapplexattr,rdonly";
-    fuse_argv[4] = argv[2];
+    std::string last = mountPoint.substr(mountPoint.find_last_of('/') + 1);
+    std::string mountOptions = "noappledouble,nobrowse,rdonly,noapplexattr,volname=" + last;
+    fuse_argv[3] = (char *)mountOptions.c_str();
+    // finally, our auto‐created mountpoint:
+    fuse_argv[4] = const_cast<char *>(mountPoint.c_str());
     fuse_argv[5] = nullptr;
 
     return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
