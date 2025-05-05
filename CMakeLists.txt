@@ -7,6 +7,8 @@ project(
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O3 -march=armv8-a -mcpu=apple-m1 -ffast-math -funroll-loops")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=armv8-a -mcpu=apple-m1 -ffast-math -funroll-loops")
 
 # Add this line to fix the fuse.h error
 add_compile_definitions(_FILE_OFFSET_BITS=64)
@@ -57,4 +59,4 @@ target_link_libraries(example
 # ---------------------------------------------------------------
 # 5) Global compiler flags
 # ---------------------------------------------------------------
-add_compile_options(-Wall -Werror -O3)
+# add_compile_options(-Wall -Werror -O3)
