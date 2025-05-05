@@ -27,6 +27,8 @@ static nlohmann::json gContainerMetadata;
 static std::vector<std::string> gFiles;
 static std::map<std::string, std::string> gCache; // path → packed DNG data
 static std::mutex gCacheMutex;
+static const size_t kMaxCacheFrames = 10;
+static std::deque<std::string> gCacheOrder; // FIFO list of cache keys
 
 // Since every frame‐DNG is the same size, cache it once
 static size_t gFrameSize = 0;
@@ -180,10 +182,21 @@ static int load_frame(const std::string &path)
         return -EIO;
     }
 
-    // store in cache
+    // store in cache (rolling buffer)
     {
         std::lock_guard<std::mutex> lk(gCacheMutex);
+
+        // if we're at max capacity, evict the oldest
+        if (gCache.size() >= kMaxCacheFrames)
+        {
+            const std::string &oldKey = gCacheOrder.front();
+            gCacheOrder.pop_front();
+            gCache.erase(oldKey);
+        }
+
+        // insert the new frame
         gCache[path] = oss.str();
+        gCacheOrder.push_back(path);
     }
 
     // record the global frame size if first time
@@ -203,6 +216,9 @@ static int load_frame(const std::string &path)
 // ATTR: report uniform size (0 until we have it)
 static int fs_getattr(const char *path, struct stat *st)
 {
+    std::cout << "fs_getattr";
+    std::cout << path;
+    std::cout << "\n";
     memset(st, 0, sizeof(*st));
     if (strcmp(path, "/") == 0)
     {
@@ -210,10 +226,6 @@ static int fs_getattr(const char *path, struct stat *st)
         st->st_nlink = 2;
         return 0;
     }
-
-    std::string fn = path + 1;
-    if (std::find(gFiles.begin(), gFiles.end(), fn) == gFiles.end())
-        return -ENOENT;
 
     st->st_mode = S_IFREG | 0444;
     st->st_nlink = 1;
@@ -228,6 +240,9 @@ static int fs_readdir(const char *path, void *buf,
                       fuse_fill_dir_t filler,
                       off_t offset, struct fuse_file_info *fi)
 {
+    std::cout << "fs_readdir";
+    std::cout << path;
+    std::cout << "\n";
     (void)offset;
     (void)fi;
     if (strcmp(path, "/") != 0)
@@ -241,6 +256,9 @@ static int fs_readdir(const char *path, void *buf,
 
 static int fs_opendir(const char *path, struct fuse_file_info *fi)
 {
+    std::cout << "fs_opendir";
+    std::cout << path;
+    std::cout << "\n";
     if (strcmp(path, "/") != 0)
         return -ENOENT;
     return 0;
@@ -248,6 +266,9 @@ static int fs_opendir(const char *path, struct fuse_file_info *fi)
 
 static int fs_releasedir(const char *path, struct fuse_file_info *fi)
 {
+    std::cout << "fs_releasedir";
+    std::cout << path;
+    std::cout << "\n";
     (void)path;
     (void)fi;
     return 0;
@@ -256,6 +277,9 @@ static int fs_releasedir(const char *path, struct fuse_file_info *fi)
 // OPEN: do the heavy work once per file
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
+    std::cout << "fs_open";
+    std::cout << path;
+    std::cout << "\n";
     std::string fn = path + 1;
     if (std::find(gFiles.begin(), gFiles.end(), fn) == gFiles.end())
         return -ENOENT;
@@ -278,6 +302,9 @@ static int fs_read(const char *path,
                    off_t offset,
                    struct fuse_file_info *fi)
 {
+    std::cout << "fs_read";
+    std::cout << path;
+    std::cout << "\n";
     (void)fi;
     std::string fn = path + 1;
     std::lock_guard<std::mutex> lk(gCacheMutex);
@@ -295,20 +322,26 @@ static int fs_read(const char *path,
 
 static int fs_statfs(const char *path, struct statvfs *st)
 {
+    std::cout << "fs_statfs";
+    std::cout << path;
+    std::cout << "\n";
     (void)path;
     memset(st, 0, sizeof(*st));
     st->f_bsize = 4096;
     st->f_frsize = 4096;
     st->f_blocks = 1024 * 1024;
-    st->f_bfree = 1024 * 1024;
-    st->f_bavail = 1024 * 1024;
-    st->f_files = gFiles.size() + 10;
-    st->f_ffree = 100000;
+    st->f_bfree = 0;
+    st->f_bavail = 0;
+    st->f_files = gFiles.size();
+    st->f_ffree = 0;
     return 0;
 }
 
 static int fs_listxattr(const char *path, char *list, size_t size)
 {
+    std::cout << "fs_listxattr";
+    std::cout << path;
+    std::cout << "\n";
     (void)path;
     (void)list;
     (void)size;
