@@ -35,6 +35,7 @@ static size_t gFrameSize = 0;
 static std::mutex gFrameSizeMutex;
 
 static std::mutex gDecoderMutex;
+static std::vector<motioncam::Timestamp> gFrameList; // <-- cached frame timestamps
 
 // builds "frame_%06d.dng"
 static std::string frameName(int i)
@@ -70,7 +71,7 @@ static int load_frame(const std::string &path)
     nlohmann::json meta;
     try
     {
-        auto ts = gDecoder->getFrames()[idx];
+        auto ts = gFrameList[idx];
         std::lock_guard<std::mutex> dlk(gDecoderMutex);
         gDecoder->loadFrame(ts, raw, meta);
     }
@@ -380,16 +381,16 @@ int main(int argc, char *argv[])
     }
 
     // 2) build file list & grab metadata
-    auto frames = gDecoder->getFrames();
+    gFrameList = gDecoder->getFrames();
     gContainerMetadata = gDecoder->getContainerMetadata();
-    std::cerr << "DEBUG: found " << frames.size() << " frames\n";
-    for (size_t i = 0; i < frames.size(); ++i)
+    std::cerr << "DEBUG: found " << gFrameList.size() << " frames\n";
+    for (size_t i = 0; i < gFrameList.size(); ++i)
         gFiles.push_back(frameName(int(i)));
 
     // 3) pre‐warm the first frame so that gFrameSize is set
     if (!gFiles.empty())
     {
-        if (int err = load_frame(gFiles[0]) < 0)
+        if (int err = load_frame(gFiles[0]); err < 0)
         {
             std::cerr << "Failed to load first frame: " << err << "\n";
             return 1;
