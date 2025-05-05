@@ -403,7 +403,7 @@ int main(int argc, char *argv[])
     fuse_argv[0] = argv[0];
     fuse_argv[1] = (char *)"-f";
     fuse_argv[2] = (char *)"-o";
-    fuse_argv[3] = (char *)"auto_cache,noappledouble,nobrowse";
+    fuse_argv[3] = (char *)"noappledouble,nobrowse,noappledouble,noapplexattr,rdonly";
     fuse_argv[4] = argv[2];
     fuse_argv[5] = nullptr;
 
