@@ -315,7 +315,7 @@ class DNGWriter {
   /// Write DNG to a file.
   /// Return error string to `err` when Write() returns false.
   /// Returns true upon success.
-  bool WriteToFile(const char *filename, std::string *err) const;
+  bool WriteToStream(std::ostream &os, std::string *err) const;
 
  private:
   bool swap_endian_;
@@ -1904,95 +1904,92 @@ DNGWriter::DNGWriter(bool big_endian) : dng_big_endian_(big_endian) {
   swap_endian_ = (IsBigEndian() != dng_big_endian_);
 }
 
-bool DNGWriter::WriteToFile(const char *filename, std::string *err) const {
-  std::ofstream ofs(filename, std::ostream::binary);
-
-  if (!ofs) {
+bool DNGWriter::WriteToStream(std::ostream &os, std::string *err) const {
+  // 0. Verify the stream is good
+  if (!os) {
     if (err) {
-      (*err) = "Failed to open file.\n";
+      *err = "Invalid output stream.\n";
     }
-
     return false;
   }
 
+  // 1. Build the TIFF header in-memory
   std::ostringstream header;
   bool ret = WriteTIFFVersionHeader(&header, dng_big_endian_);
   if (!ret) {
     if (err) {
-      (*err) = "Failed to write TIFF version header.\n";
+      *err = "Failed to write TIFF version header.\n";
     }
     return false;
   }
 
-  if (images_.size() == 0) {
+  if (images_.empty()) {
     if (err) {
-      (*err) = "No image added for writing.\n";
+      *err = "No image added for writing.\n";
     }
-
     return false;
   }
 
-  // 1. Compute offset and data size(exclude TIFF header bytes)
+  // 2. Compute offsets and total data size (excluding TIFF header)
   size_t data_len = 0;
-  size_t strip_offset = 0;
   std::vector<size_t> data_offset_table;
   std::vector<size_t> strip_offset_table;
-  for (size_t i = 0; i < images_.size(); i++) {
-    strip_offset = data_len + images_[i]->GetStripOffset();
+  data_offset_table.reserve(images_.size());
+  strip_offset_table.reserve(images_.size());
+
+  for (size_t i = 0; i < images_.size(); ++i) {
+    size_t strip_offset = data_len + images_[i]->GetStripOffset();
     data_offset_table.push_back(data_len);
     strip_offset_table.push_back(strip_offset);
     data_len += images_[i]->GetDataSize();
   }
 
-  // 2. Write offset to ifd table.
+  // 3. Compute and write the IFD offset (after header + all data)
   const unsigned int ifd_offset =
       kHeaderSize + static_cast<unsigned int>(data_len);
   Write4(ifd_offset, &header, swap_endian_);
 
   assert(header.str().length() == 8);
 
-  // std::cout << "ifd_offset " << ifd_offset << std::endl;
-  // std::cout << "data_len " << data_os_.str().length() << std::endl;
-  // std::cout << "ifd_len " << ifd_os_.str().length() << std::endl;
-  // std::cout << "swap endian " << swap_endian_ << std::endl;
+  // 4. Flush the header to the output stream
+  std::string header_str = header.str();
+  os.write(header_str.c_str(),
+           static_cast<std::streamsize>(header_str.size()));
 
-  // 3. Write header
-  ofs.write(header.str().c_str(),
-            static_cast<std::streamsize>(header.str().length()));
-
-  // 4. Write image and meta data
-  // TODO(syoyo): Write IFD first, then image/meta data
-  for (size_t i = 0; i < images_.size(); i++) {
-    bool ok = images_[i]->WriteDataToStream(&ofs);
-    if (!ok) {
+  // 5. Write all image data
+  for (size_t i = 0; i < images_.size(); ++i) {
+    if (!images_[i]->WriteDataToStream(&os)) {
       if (err) {
         std::stringstream ss;
-        ss << "Failed to write data at image[" << i << "]. err = " << images_[i]->Error() << "\n";
-        (*err) += ss.str();
+        ss << "Failed to write data at image[" << i
+           << "]. err = " << images_[i]->Error() << "\n";
+        *err += ss.str();
       }
       return false;
     }
   }
 
-  // 5. Write IFD entries;
-  for (size_t i = 0; i < images_.size(); i++) {
-    bool ok = images_[i]->WriteIFDToStream(
-        static_cast<unsigned int>(data_offset_table[i]),
-        static_cast<unsigned int>(strip_offset_table[i]), &ofs);
-    if (!ok) {
+  // 6. Write IFD entries and next-IFD pointers
+  for (size_t i = 0; i < images_.size(); ++i) {
+    if (!images_[i]->WriteIFDToStream(
+            static_cast<unsigned int>(data_offset_table[i]),
+            static_cast<unsigned int>(strip_offset_table[i]),
+            &os)) {
       if (err) {
         std::stringstream ss;
-        ss << "Failed to write IFD at image[" << i << "]. err = " << images_[i]->Error() << "\n";
-        (*err) += ss.str();
+        ss << "Failed to write IFD at image[" << i
+           << "]. err = " << images_[i]->Error() << "\n";
+        *err += ss.str();
       }
       return false;
     }
 
+    // compute next-IFD offset
     unsigned int next_ifd_offset =
-        static_cast<unsigned int>(ofs.tellp()) + sizeof(unsigned int);
+        static_cast<unsigned int>(os.tellp()) + sizeof(unsigned int);
 
-    if (i == (images_.size() - 1)) {
-      // Write zero as IFD offset(= end of data)
+    // last image → zero terminate
+    if (i + 1 == images_.size()) {
       next_ifd_offset = 0;
     }
 
@@ -2000,7 +1997,8 @@ bool DNGWriter::WriteToFile(const char *filename, std::string *err) const {
       swap4(&next_ifd_offset);
     }
 
-    ofs.write(reinterpret_cast<const char *>(&next_ifd_offset), 4);
+    os.write(reinterpret_cast<const char *>(&next_ifd_offset),
+             sizeof(next_ifd_offset));
   }
 
   return true;
