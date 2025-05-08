@@ -4,6 +4,12 @@ A FUSE-based virtual filesystem that mounts all `.mcraw` files in the current di
 
 ---
 
+## Demo
+
+[![Watch the video](https://img.youtube.com/vi/1JCld9Bp7mw/0.jpg)](https://www.youtube.com/watch?v=1JCld9Bp7mw)
+
+---
+
 ## Downloads
 
 [Releases page](https://github.com/baso53/mcraw-mounter/releases)  
