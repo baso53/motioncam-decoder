@@ -41,8 +41,8 @@
     #include <tinydng/tiny_dng_writer.h>
 #undef TINY_DNG_WRITER_IMPLEMENTATION
 
-void writeAudio(
-    const std::string& outputPath,
+bool getAudio(
+    std::vector<uint8_t>& fileData,
     const int sampleRateHz,
     const int numChannels,
     std::vector<motioncam::AudioChunk>& audioChunks)
@@ -66,8 +66,8 @@ void writeAudio(
                 audio.samples[0].push_back(x.second[i]);
         }
     }
-    
-    audio.save(outputPath);
+
+    return audio.getFileData(fileData);
 }
 
 struct FSContext {
@@ -75,7 +75,7 @@ struct FSContext {
     nlohmann::json containerMetadata;
     std::vector<std::string> filenames;
     std::map<std::string, std::string> frameCache;
-    static constexpr size_t MAX_CACHE_FRAMES = 10;
+    static constexpr size_t MAX_CACHE_FRAMES = 5;
     std::deque<std::string> frameCacheOrder;
     size_t frameSize = 0;
     std::vector<motioncam::Timestamp> frameList;
@@ -88,6 +88,8 @@ struct FSContext {
         colorMatrix2,
         forwardMatrix1,
         forwardMatrix2;
+    std::vector<uint8_t> audioWavData;
+    size_t               audioSize = 0;
 };
 
 static std::map<std::string, FSContext> contexts;
@@ -285,6 +287,18 @@ static int fs_getattr(const char *path, struct stat *st)
     if (it == contexts.end())
         return -ENOENT;
     FSContext &ctx = it->second;
+
+    // if they asked for "audio.wav"
+    if (fname == "audio.wav") {
+        if (ctx.audioSize == 0)
+            return -ENOENT;
+        st->st_mode = S_IFREG | 0444;
+        st->st_nlink = 1;
+        st->st_size = (off_t)ctx.audioSize;
+        return 0;
+    }
+
+    // else must be one of the frame DNGs
     if (std::find(ctx.filenames.begin(), ctx.filenames.end(), fname) == ctx.filenames.end())
         return -ENOENT;
 
@@ -320,8 +334,15 @@ static int fs_readdir(const char *path, void *buf,
 
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
+
+    // list frames
     for (auto &f : ctx.filenames)
         filler(buf, f.c_str(), nullptr, 0);
+
+    // list the audio file
+    if (ctx.audioSize)
+        filler(buf, "audio.wav", nullptr, 0);
+
     return 0;
 }
 
@@ -342,6 +363,13 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
     if (it == contexts.end())
         return -ENOENT;
     FSContext &ctx = it->second;
+
+    // allow read‐only audio.wav
+    if (fname == "audio.wav") {
+        return (fi->flags & 3) == O_RDONLY ? 0 : -EACCES;
+    }
+
+    // otherwise fall through to DNG frames
     if (std::find(ctx.filenames.begin(), ctx.filenames.end(), fname) == ctx.filenames.end())
         return -ENOENT;
     if ((fi->flags & 3) != O_RDONLY)
@@ -370,19 +398,25 @@ static int fs_read(const char *path,
         return -ENOENT;
     FSContext &ctx = it->second;
 
-    // 1) trigger decode if needed
+    // if it's the audio.wav, serve the buffer
+    if (fname == "audio.wav") {
+        if ((size_t)offset >= ctx.audioSize)
+            return 0;
+        size_t tocopy = std::min<size_t>(size, ctx.audioSize - (size_t)offset);
+        memcpy(buf, ctx.audioWavData.data() + offset, tocopy);
+        return (ssize_t)tocopy;
+    }
+
+    // otherwise decode & serve a frame
     int err = load_frame(&ctx, fname);
     if (err < 0)
         return err;
-
     auto it2 = ctx.frameCache.find(fname);
     if (it2 == ctx.frameCache.end())
         return -ENOENT;
-
     const std::string &data = it2->second;
     if ((size_t)offset >= data.size())
         return 0;
-
     size_t tocopy = std::min<size_t>(size, data.size() - (size_t)offset);
     memcpy(buf, data.data() + offset, tocopy);
     return (ssize_t)tocopy;
@@ -428,7 +462,7 @@ int main(int argc, char *argv[])
                 std::cerr << "Decoder error ("<<fn<<"): " << e.what() << "\n";
                 continue;
             }
-            // preload
+            // preload frames + metadata
             ctx.frameList = ctx.decoder->getFrames();
             ctx.containerMetadata = ctx.decoder->getContainerMetadata();
             cache_container_metadata(&ctx);
@@ -438,6 +472,24 @@ int main(int argc, char *argv[])
             // warm up first frame
             if (!ctx.filenames.empty())
                 load_frame(&ctx, ctx.filenames[0]);
+
+            // ------------------------------------------------------------------
+            // extract & build WAV in memory from the decoder’s audio
+            // ------------------------------------------------------------------
+            try {
+                std::vector<motioncam::AudioChunk> audioChunks;
+                std::vector<uint8_t> fileData;
+                ctx.decoder->loadAudio(audioChunks);
+                int sampleRate   = ctx.decoder->audioSampleRateHz();
+                int numChannels  = ctx.decoder->numAudioChannels();
+                auto wavBytes    = getAudio(fileData, sampleRate, numChannels, audioChunks);
+                ctx.audioWavData.assign(fileData.begin(), fileData.end());
+                ctx.audioSize = ctx.audioWavData.size();
+            }
+            catch (std::exception &e) {
+                std::cerr << "Audio processing error ("<<fn<<"): " << e.what() << "\n";
+            }
+            // ------------------------------------------------------------------
 
             contexts.emplace(base, std::move(ctx));
         }
@@ -449,7 +501,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // 2) ensure mount‐point directory exists
+    // 2) ensure mount-point directory exists
     std::string mountPoint = "mcraws";
     if (::mkdir(mountPoint.c_str(), 0755) != 0 && errno != EEXIST) {
         std::cerr << "Error creating mountpoint '" << mountPoint
@@ -471,10 +523,10 @@ int main(int argc, char *argv[])
     char *fuse_argv[7];
     fuse_argv[0] = argv[0];
     fuse_argv[1] = (char*)"-f";  // foreground
-    fuse_argv[2] = (char*)"-s";  // single‐threaded
+    fuse_argv[2] = (char*)"-s";  // single-threaded
     fuse_argv[3] = (char*)"-o";  // mount options
     fuse_argv[4] = (char*)mountOptions.c_str();
-    fuse_argv[5] = (char*)mountPoint.c_str();  // mount‐point
+    fuse_argv[5] = (char*)mountPoint.c_str();  // mount-point
     fuse_argv[6] = nullptr;
 
     // 4) run FUSE

@@ -102,6 +102,11 @@ public:
      * @Returns true if the file was successfully saved
      */
     bool save (std::string filePath, AudioFileFormat format = AudioFileFormat::Wave);
+
+    /** Writes an audio file to a given vector.
+     * @Returns true if the file was successfully written
+     */
+    bool getFileData (std::vector<uint8_t>& outputBuffer, AudioFileFormat format = AudioFileFormat::Wave);
         
     //=============================================================
     /** Loads an audio file from data in memory */
@@ -192,6 +197,9 @@ private:
     //=============================================================
     bool saveToWaveFile (std::string filePath);
     bool saveToAiffFile (std::string filePath);
+
+    bool getWaveFile(std::vector<uint8_t>& outputBuffer);
+    bool getAiffFile(std::vector<uint8_t>& outputBuffer);
     
     //=============================================================
     void clearAudioBuffer();
@@ -932,12 +940,25 @@ bool AudioFile<T>::save (std::string filePath, AudioFileFormat format)
     return false;
 }
 
+template <class T>
+bool AudioFile<T>::getFileData (std::vector<uint8_t>& outputBuffer, AudioFileFormat format)
+{
+    if (format == AudioFileFormat::Wave)
+    {
+        return getWaveFile (outputBuffer);
+    }
+    else if (format == AudioFileFormat::Aiff)
+    {
+        return getAiffFile (outputBuffer);
+    }
+    
+    return false;
+}
+
 //=============================================================
 template <class T>
-bool AudioFile<T>::saveToWaveFile (std::string filePath)
+bool AudioFile<T>::getWaveFile(std::vector<uint8_t>& fileData)
 {
-    std::vector<uint8_t> fileData;
-    
     int32_t dataChunkSize = getNumSamplesPerChannel() * (getNumChannels() * bitDepth / 8);
     int16_t audioFormat = bitDepth == 32 && std::is_floating_point_v<T> ? WavAudioFormat::IEEEFloat : WavAudioFormat::PCM;
     int32_t formatChunkSize = audioFormat == WavAudioFormat::PCM ? 16 : 18;
@@ -1041,20 +1062,26 @@ bool AudioFile<T>::saveToWaveFile (std::string filePath)
     // check that the various sizes we put in the metadata are correct
     if (fileSizeInBytes != static_cast<int32_t> (fileData.size() - 8) || dataChunkSize != (getNumSamplesPerChannel() * getNumChannels() * (bitDepth / 8)))
     {
-        reportError ("ERROR: couldn't save file to " + filePath);
+        reportError ("ERROR: couldn't save file");
         return false;
     }
     
+    return true;
+}
+
+template <class T>
+bool AudioFile<T>::saveToWaveFile (std::string filePath)
+{
     // try to write the file
+    std::vector<uint8_t> fileData;
+    getWaveFile(fileData);
     return writeDataToFile (fileData, filePath);
 }
 
 //=============================================================
 template <class T>
-bool AudioFile<T>::saveToAiffFile (std::string filePath)
+bool AudioFile<T>::getAiffFile(std::vector<uint8_t>& fileData)
 {
-    std::vector<uint8_t> fileData;
-    
     int32_t numBytesPerSample = bitDepth / 8;
     int32_t numBytesPerFrame = numBytesPerSample * getNumChannels();
     int32_t totalNumAudioSampleBytes = getNumSamplesPerChannel() * numBytesPerFrame;
@@ -1146,11 +1173,19 @@ bool AudioFile<T>::saveToAiffFile (std::string filePath)
     // check that the various sizes we put in the metadata are correct
     if (fileSizeInBytes != static_cast<int32_t> (fileData.size() - 8) || soundDataChunkSize != getNumSamplesPerChannel() *  numBytesPerFrame + 8)
     {
-        reportError ("ERROR: couldn't save file to " + filePath);
+        reportError ("ERROR: couldn't save file.");
         return false;
     }
     
+    return true;
+}
+
+template <class T>
+bool AudioFile<T>::saveToAiffFile (std::string filePath)
+{
     // try to write the file
+    std::vector<uint8_t> fileData;
+    getAiffFile(fileData);
     return writeDataToFile (fileData, filePath);
 }
 
