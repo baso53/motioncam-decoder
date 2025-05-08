@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <dirent.h>   // for scanning directory
 #include <limits.h>   // for PATH_MAX
+#include <mach-o/dyld.h> // For _NSGetExecutablePath
 
 #include <motioncam/Decoder.hpp>
 #include <audiofile/AudioFile.h>
@@ -431,47 +432,68 @@ static struct fuse_operations fs_ops = {
 
 int main(int argc, char *argv[])
 {
-    if (argc != 1)
-    {
-        std::cerr << "Usage: " << argv[0];
+    // This program takes no arguments (we manage FUSE args ourselves).
+    if (argc != 1) {
+        std::cerr << "Usage: " << argv[0] << "\n";
         return 1;
     }
 
-    // 1) find all .mcraw files in current directory
-    char cwd[PATH_MAX];
-    if (!getcwd(cwd, sizeof(cwd))) {
-        std::cerr << "Error: cannot get current directory\n";
-        return 1;
+    // 1) figure out our own executable's directory
+    char exePath[PATH_MAX];
+    uint32_t size = sizeof(exePath);
+    if (_NSGetExecutablePath(exePath, &size) != 0) {
+        fprintf(stderr, "Executable path too long\n");
+        exit(1);
     }
+    // dirname() may modify its argument
+    std::string appDir = dirname(exePath);
 
-    DIR *d = opendir(cwd);
+    // 2) scan that directory for *.mcraw files
+    DIR *d = opendir(appDir.c_str());
     if (!d) {
-        std::cerr << "Error: cannot open current directory\n";
+        std::cerr << "Error: cannot open directory " << appDir << "\n";
         return 1;
     }
 
     struct dirent *ent;
     while ((ent = readdir(d)) != nullptr) {
         std::string fn = ent->d_name;
-        if (fn.size() > 6 && fn.substr(fn.size()-6) == ".mcraw") {
-            std::string base = fn.substr(0, fn.size()-6);
+        // only care about files ending in ".mcraw"
+        if (fn.size() > 6 && fn.compare(fn.size()-6, 6, ".mcraw") == 0) {
+            // build full absolute path
+            std::string fullPath = appDir + "/" + fn;
+            std::string baseName = fn.substr(0, fn.size()-6);
+
+            std::cout << "Found file: " << fullPath << "\n";
+
             FSContext ctx;
             try {
-                ctx.decoder = new motioncam::Decoder(fn);
-            } catch (std::exception &e) {
-                std::cerr << "Decoder error ("<<fn<<"): " << e.what() << "\n";
+                // pass the absolute path into the decoder
+                ctx.decoder = new motioncam::Decoder(fullPath);
+            }
+            catch (std::exception &e) {
+                std::cerr << "Decoder error (" << fullPath << "): "
+                     << e.what() << "\n";
                 continue;
             }
+
             // preload frames + metadata
-            ctx.frameList = ctx.decoder->getFrames();
+            ctx.frameList         = ctx.decoder->getFrames();
             ctx.containerMetadata = ctx.decoder->getContainerMetadata();
             cache_container_metadata(&ctx);
-            std::cerr << "DEBUG: ["<<fn<<"] found " << ctx.frameList.size() << " frames\n";
-            for (size_t i = 0; i < ctx.frameList.size(); ++i)
+
+            std::cerr << "DEBUG: [" << fullPath << "] found "
+                 << ctx.frameList.size() << " frames\n";
+
+            // prepare filename list
+            for (size_t i = 0; i < ctx.frameList.size(); ++i) {
                 ctx.filenames.push_back(frameName(int(i)));
+            }
+
             // warm up first frame
-            if (!ctx.filenames.empty())
+            if (!ctx.filenames.empty()) {
                 load_frame(&ctx, ctx.filenames[0]);
+            }
 
             // ------------------------------------------------------------------
             // extract & build WAV in memory from the decoder’s audio
@@ -480,32 +502,42 @@ int main(int argc, char *argv[])
                 std::vector<motioncam::AudioChunk> audioChunks;
                 std::vector<uint8_t> fileData;
                 ctx.decoder->loadAudio(audioChunks);
-                int sampleRate   = ctx.decoder->audioSampleRateHz();
-                int numChannels  = ctx.decoder->numAudioChannels();
-                auto wavBytes    = getAudio(fileData, sampleRate, numChannels, audioChunks);
+
+                int sampleRate  = ctx.decoder->audioSampleRateHz();
+                int numChannels = ctx.decoder->numAudioChannels();
+
+                auto wavBytes = getAudio(
+                    fileData,
+                    sampleRate,
+                    numChannels,
+                    audioChunks
+                );
+
                 ctx.audioWavData.assign(fileData.begin(), fileData.end());
                 ctx.audioSize = ctx.audioWavData.size();
             }
             catch (std::exception &e) {
-                std::cerr << "Audio processing error ("<<fn<<"): " << e.what() << "\n";
+                std::cerr << "Audio processing error (" << fullPath << "): "
+                     << e.what() << "\n";
             }
             // ------------------------------------------------------------------
 
-            contexts.emplace(base, std::move(ctx));
+            // stash context under the base name
+            contexts.emplace(baseName, std::move(ctx));
         }
     }
     closedir(d);
 
     if (contexts.empty()) {
-        std::cerr << "No .mcraw files found in current directory\n";
+        std::cerr << "No .mcraw files found in " << appDir << "\n";
         return 1;
     }
 
-    // 2) ensure mount-point directory exists
-    std::string mountPoint = "mcraws";
+    // 3) ensure the mount‐point exists
+    std::string mountPoint = appDir + "/mcraws";
     if (::mkdir(mountPoint.c_str(), 0755) != 0 && errno != EEXIST) {
         std::cerr << "Error creating mountpoint '" << mountPoint
-                  << "': " << strerror(errno) << "\n";
+             << "': " << strerror(errno) << "\n";
         return 1;
     }
 
@@ -526,9 +558,9 @@ int main(int argc, char *argv[])
     fuse_argv[2] = (char*)"-s";  // single-threaded
     fuse_argv[3] = (char*)"-o";  // mount options
     fuse_argv[4] = (char*)mountOptions.c_str();
-    fuse_argv[5] = (char*)mountPoint.c_str();  // mount-point
+    fuse_argv[5] = (char*)mountPoint.c_str();
     fuse_argv[6] = nullptr;
 
-    // 4) run FUSE
+    // 5) run FUSE loop
     return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
 }
