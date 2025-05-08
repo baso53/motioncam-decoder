@@ -68,60 +68,60 @@ void writeAudio(
     audio.save(outputPath);
 }
 
-// globals
-static motioncam::Decoder *decoder = nullptr;
-static nlohmann::json containerMetadata;
-static std::vector<std::string> filenames;
-static std::map<std::string, std::string> frameCache;
-static const size_t MAX_CACHE_FRAMES = 10;
-static std::deque<std::string> frameCacheOrder;
-static size_t frameSize = 0;
-static std::vector<motioncam::Timestamp> frameList;
+struct FSContext {
+    motioncam::Decoder *decoder = nullptr;
+    nlohmann::json containerMetadata;
+    std::vector<std::string> filenames;
+    std::map<std::string, std::string> frameCache;
+    static constexpr size_t MAX_CACHE_FRAMES = 10;
+    std::deque<std::string> frameCacheOrder;
+    size_t frameSize = 0;
+    std::vector<motioncam::Timestamp> frameList;
 
-// container globals
-static std::vector<uint16_t> blackLevels;
-static double whiteLevel = 0.0;
-static std::array<uint8_t, 4> cfa = {{0, 1, 1, 2}};
-static uint16_t orientation;
-static std::vector<float> colorMatrix1,
-    colorMatrix2,
-    forwardMatrix1,
-    forwardMatrix2;
+    std::vector<uint16_t> blackLevels;
+    double whiteLevel = 0.0;
+    std::array<uint8_t, 4> cfa = {{0, 1, 1, 2}};
+    uint16_t orientation;
+    std::vector<float> colorMatrix1,
+        colorMatrix2,
+        forwardMatrix1,
+        forwardMatrix2;
+};
 
 // call this once, right after containerMetadata is set:
-static void cache_container_metadata()
+static void cache_container_metadata(FSContext *ctx)
 {
     // Black levels
-    std::vector<uint16_t> blackLevel = containerMetadata["blackLevel"];
-    blackLevels.clear();
-    blackLevels.reserve(blackLevel.size());
+    std::vector<uint16_t> blackLevel = ctx->containerMetadata["blackLevel"];
+    ctx->blackLevels.clear();
+    ctx->blackLevels.reserve(blackLevel.size());
     for (float v : blackLevel)
-        blackLevels.push_back(uint16_t(std::lround(v)));
+        ctx->blackLevels.push_back(uint16_t(std::lround(v)));
 
     // White level
-    whiteLevel = containerMetadata["whiteLevel"];
+    ctx->whiteLevel = ctx->containerMetadata["whiteLevel"];
 
     // CFA pattern
-    std::string sensorArrangement = containerMetadata["sensorArrangment"];
-    colorMatrix1 = containerMetadata["colorMatrix1"].get<std::vector<float>>();
-    colorMatrix2 = containerMetadata["colorMatrix2"].get<std::vector<float>>();
-    forwardMatrix1 = containerMetadata["forwardMatrix1"].get<std::vector<float>>();
-    forwardMatrix2 = containerMetadata["forwardMatrix2"].get<std::vector<float>>();
+    std::string sensorArrangement = ctx->containerMetadata["sensorArrangment"];
+    ctx->colorMatrix1 = ctx->containerMetadata["colorMatrix1"].get<std::vector<float>>();
+    ctx->colorMatrix2 = ctx->containerMetadata["colorMatrix2"].get<std::vector<float>>();
+    ctx->forwardMatrix1 = ctx->containerMetadata["forwardMatrix1"].get<std::vector<float>>();
+    ctx->forwardMatrix2 = ctx->containerMetadata["forwardMatrix2"].get<std::vector<float>>();
 
     if (sensorArrangement == "rggb")
-        cfa = {{0, 1, 1, 2}};
+        ctx->cfa = {{0, 1, 1, 2}};
     else if (sensorArrangement == "bggr")
-        cfa = {{2, 1, 1, 0}};
+        ctx->cfa = {{2, 1, 1, 0}};
     else if (sensorArrangement == "grbg")
-        cfa = {{1, 0, 2, 1}};
+        ctx->cfa = {{1, 0, 2, 1}};
     else if (sensorArrangement == "gbrg")
-        cfa = {{1, 2, 0, 1}};
+        ctx->cfa = {{1, 2, 0, 1}};
     else
-        cfa = {{0, 1, 1, 2}};
+        ctx->cfa = {{0, 1, 1, 2}};
 
-    if (containerMetadata.contains("orientation"))
+    if (ctx->containerMetadata.contains("orientation"))
     {
-        orientation = uint16_t(containerMetadata["orientation"].get<int>());
+        ctx->orientation = uint16_t(ctx->containerMetadata["orientation"].get<int>());
     }
 }
 
@@ -134,17 +134,17 @@ static std::string frameName(int i)
 
 // decode one frame into frameCache[path]
 // after writing to cache, if this is the first frame, record its size
-static int load_frame(const std::string &path)
+static int load_frame(const std::string &path, FSContext *ctx)
 {
     { // fast‐path if cached
-        if (frameCache.count(path))
+        if (ctx->frameCache.count(path))
             return 0;
     }
 
     // find the frame index
     int idx = -1;
-    for (size_t i = 0; i < filenames.size(); ++i)
-        if (filenames[i] == path)
+    for (size_t i = 0; i < ctx->filenames.size(); ++i)
+        if (ctx->filenames[i] == path)
         {
             idx = int(i);
             break;
@@ -157,8 +157,8 @@ static int load_frame(const std::string &path)
     nlohmann::json metadata;
     try
     {
-        auto ts = frameList[idx];
-        decoder->loadFrame(ts, raw, metadata);
+        auto ts = ctx->frameList[idx];
+        ctx->decoder->loadFrame(ts, raw, metadata);
     }
     catch (std::exception &e)
     {
@@ -186,11 +186,11 @@ static int load_frame(const std::string &path)
     dng.SetCFARepeatPatternDim(2, 2);
     
     dng.SetBlackLevelRepeatDim(2, 2);
-    dng.SetBlackLevel(uint32_t(blackLevels.size()), blackLevels.data());
-    dng.SetWhiteLevel(whiteLevel);
+    dng.SetBlackLevel(uint32_t(ctx->blackLevels.size()), ctx->blackLevels.data());
+    dng.SetWhiteLevel(ctx->whiteLevel);
     dng.SetCompression(tinydngwriter::COMPRESSION_NONE);
 
-    dng.SetCFAPattern(4, cfa.data());
+    dng.SetCFAPattern(4, ctx->cfa.data());
     
     // Rectangular
     dng.SetCFALayout(1);
@@ -198,11 +198,11 @@ static int load_frame(const std::string &path)
     const uint16_t bps[1] = { 16 };
     dng.SetBitsPerSample(1, bps);
     
-    dng.SetColorMatrix1(3, colorMatrix1.data());
-    dng.SetColorMatrix2(3, colorMatrix2.data());
+    dng.SetColorMatrix1(3, ctx->colorMatrix1.data());
+    dng.SetColorMatrix2(3, ctx->colorMatrix2.data());
 
-    dng.SetForwardMatrix1(3, forwardMatrix1.data());
-    dng.SetForwardMatrix2(3, forwardMatrix2.data());
+    dng.SetForwardMatrix1(3, ctx->forwardMatrix1.data());
+    dng.SetForwardMatrix2(3, ctx->forwardMatrix2.data());
     
     dng.SetAsShotNeutral(3, asShotNeutral.data());
     
@@ -214,8 +214,8 @@ static int load_frame(const std::string &path)
     
     const uint32_t activeArea[4] = { 0, 0, height, width };
     dng.SetActiveArea(&activeArea[0]);
-    if (orientation) {
-        dng.SetOrientation(orientation);
+    if (ctx->orientation) {
+        dng.SetOrientation(ctx->orientation);
     }
 
     // Write DNG
@@ -231,20 +231,20 @@ static int load_frame(const std::string &path)
 
     // insert into rolling‐buffer cache
     {
-        if (frameCache.size() >= MAX_CACHE_FRAMES)
+        if (ctx->frameCache.size() >= FSContext::MAX_CACHE_FRAMES)
         {
-            frameCache.erase(frameCacheOrder.front());
-            frameCacheOrder.pop_front();
+            ctx->frameCache.erase(ctx->frameCacheOrder.front());
+            ctx->frameCacheOrder.pop_front();
         }
-        frameCache[path] = oss.str();
-        frameCacheOrder.push_back(path);
+        ctx->frameCache[path] = oss.str();
+        ctx->frameCacheOrder.push_back(path);
     }
 
     // record frame‐size once
     {
-        if (frameSize == 0)
+        if (ctx->frameSize == 0)
         {
-            frameSize = frameCache[path].size();
+            ctx->frameSize = ctx->frameCache[path].size();
         }
     }
 
@@ -254,6 +254,7 @@ static int load_frame(const std::string &path)
 // report uniform size (0 until we have it)
 static int fs_getattr(const char *path, struct stat *st)
 {
+    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
     std::cout << "fs_getattr";
     std::cout << path;
     std::cout << "\n";
@@ -268,7 +269,7 @@ static int fs_getattr(const char *path, struct stat *st)
     st->st_mode = S_IFREG | 0444;
     st->st_nlink = 1;
     {
-        st->st_size = (off_t)frameSize;
+        st->st_size = (off_t)ctx->frameSize;
     }
     return 0;
 }
@@ -277,6 +278,7 @@ static int fs_readdir(const char *path, void *buf,
                       fuse_fill_dir_t filler,
                       off_t offset, struct fuse_file_info *fi)
 {
+    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
     std::cout << "fs_readdir";
     std::cout << path;
     std::cout << "\n";
@@ -286,16 +288,17 @@ static int fs_readdir(const char *path, void *buf,
         return -ENOENT;
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
-    for (auto &f : filenames)
+    for (auto &f : ctx->filenames)
         filler(buf, f.c_str(), nullptr, 0);
     return 0;
 }
 
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
+    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
     std::cout << "fs_open" << path << "\n";
     std::string fn = path + 1;
-    if (std::find(filenames.begin(), filenames.end(), fn) == filenames.end())
+    if (std::find(ctx->filenames.begin(), ctx->filenames.end(), fn) == ctx->filenames.end())
         return -ENOENT;
     if ((fi->flags & 3) != O_RDONLY)
         return -EACCES;
@@ -310,20 +313,21 @@ static int fs_read(const char *path,
                    off_t offset,
                    struct fuse_file_info *fi)
 {
+    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
     (void)fi;
     std::cout << "fs_read" << path << "\n";
 
     std::string fn = path + 1;
 
     // 1) trigger the lazy‐decode if we haven't already cached it
-    int err = load_frame(fn);
+    int err = load_frame(fn, ctx);
     if (err < 0)
         return err;
 
-    // 2) we know it's in gCache now; copy out the bytes
+    // 2) we know it's in cache now; copy out the bytes
 
-    auto it = frameCache.find(fn);
-    if (it == frameCache.end())
+    auto it = ctx->frameCache.find(fn);
+    if (it == ctx->frameCache.end())
         return -ENOENT; // should never happen, load_frame just inserted it
 
     const std::string &data = it->second;
@@ -350,6 +354,8 @@ int main(int argc, char *argv[])
                   << " <input.motioncam>\n";
         return 1;
     }
+
+    FSContext ctx;
 
     // 1) figure out mount‐point directory: same folder, same basename (no .mcraw)
     std::string inputPath = argv[1];
@@ -383,7 +389,7 @@ int main(int argc, char *argv[])
     // 2) open decoder
     try
     {
-        decoder = new motioncam::Decoder(inputPath);
+        ctx.decoder = new motioncam::Decoder(inputPath);
     }
     catch (std::exception &e)
     {
@@ -392,18 +398,18 @@ int main(int argc, char *argv[])
     }
 
     // 3) preload metadata & frame‐list
-    frameList = decoder->getFrames();
-    containerMetadata = decoder->getContainerMetadata();
-    cache_container_metadata();
+    ctx.frameList = ctx.decoder->getFrames();
+    ctx.containerMetadata = ctx.decoder->getContainerMetadata();
+    cache_container_metadata(&ctx);
 
-    std::cerr << "DEBUG: found " << frameList.size() << " frames\n";
-    for (size_t i = 0; i < frameList.size(); ++i)
-        filenames.push_back(frameName(int(i)));
+    std::cerr << "DEBUG: found " << ctx.frameList.size() << " frames\n";
+    for (size_t i = 0; i < ctx.frameList.size(); ++i)
+        ctx.filenames.push_back(frameName(int(i)));
 
     // 4) warm up first frame so frameSize is known
-    if (!filenames.empty())
+    if (!ctx.filenames.empty())
     {
-        if (int err = load_frame(filenames[0]); err < 0)
+        if (int err = load_frame(ctx.filenames[0], &ctx); err < 0)
         {
             std::cerr << "Failed to load first frame: " << err << "\n";
             return 1;
@@ -424,5 +430,5 @@ int main(int argc, char *argv[])
     fuse_argv[5] = const_cast<char *>(mountPoint.c_str());
     fuse_argv[6] = nullptr;
 
-    return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
+    return fuse_main(fuse_argc, fuse_argv, &fs_ops, &ctx);
 }
