@@ -14,7 +14,25 @@
  * limitations under the License.
  */
 
+#define FUSE_USE_VERSION 29
+
+#include <fuse.h>
+#include <vector>
+#include <string>
+#include <map>
+#include <deque>
+#include <algorithm>
+#include <sstream>
 #include <iostream>
+#include <cmath>
+#include <unistd.h>
+#include <sys/statvfs.h>
+#include <cstring>    // for strdup, strerror
+#include <libgen.h>   // for dirname(), basename()
+#include <sys/stat.h> // for mkdir
+#include <errno.h>
+#include <dirent.h>   // for scanning directory
+#include <limits.h>   // for PATH_MAX
 
 #include <motioncam/Decoder.hpp>
 #include <audiofile/AudioFile.h>
@@ -23,8 +41,8 @@
     #include <tinydng/tiny_dng_writer.h>
 #undef TINY_DNG_WRITER_IMPLEMENTATION
 
-void writeAudio(
-    const std::string& outputPath,
+bool getAudio(
+    std::vector<uint8_t>& fileData,
     const int sampleRateHz,
     const int numChannels,
     std::vector<motioncam::AudioChunk>& audioChunks)
@@ -48,36 +66,122 @@ void writeAudio(
                 audio.samples[0].push_back(x.second[i]);
         }
     }
-    
-    audio.save(outputPath);
+
+    return audio.getFileData(fileData);
 }
 
-void writeDng(
-    const std::string& outputPath,
-    const std::vector<uint16_t>& data,
-    const nlohmann::json& metadata,
-    const nlohmann::json& containerMetadata)
+struct FSContext {
+    motioncam::Decoder *decoder = nullptr;
+    nlohmann::json containerMetadata;
+    std::vector<std::string> filenames;
+    std::map<std::string, std::string> frameCache;
+    static constexpr size_t MAX_CACHE_FRAMES = 5;
+    std::deque<std::string> frameCacheOrder;
+    size_t frameSize = 0;
+    std::vector<motioncam::Timestamp> frameList;
+
+    std::vector<uint16_t> blackLevels;
+    double whiteLevel = 0.0;
+    std::array<uint8_t, 4> cfa = {{0, 1, 1, 2}};
+    uint16_t orientation;
+    std::vector<float> colorMatrix1,
+        colorMatrix2,
+        forwardMatrix1,
+        forwardMatrix2;
+    std::vector<uint8_t> audioWavData;
+    size_t               audioSize = 0;
+};
+
+static std::map<std::string, FSContext> contexts;
+
+// call this once, right after containerMetadata is set:
+static void cache_container_metadata(FSContext *ctx)
 {
+    // Black levels
+    std::vector<uint16_t> blackLevel = ctx->containerMetadata["blackLevel"];
+    ctx->blackLevels.clear();
+    ctx->blackLevels.reserve(blackLevel.size());
+    for (float v : blackLevel)
+        ctx->blackLevels.push_back(uint16_t(std::lround(v)));
+
+    // White level
+    ctx->whiteLevel = ctx->containerMetadata["whiteLevel"];
+
+    // CFA pattern
+    std::string sensorArrangement = ctx->containerMetadata["sensorArrangment"];
+    ctx->colorMatrix1 = ctx->containerMetadata["colorMatrix1"].get<std::vector<float>>();
+    ctx->colorMatrix2 = ctx->containerMetadata["colorMatrix2"].get<std::vector<float>>();
+    ctx->forwardMatrix1 = ctx->containerMetadata["forwardMatrix1"].get<std::vector<float>>();
+    ctx->forwardMatrix2 = ctx->containerMetadata["forwardMatrix2"].get<std::vector<float>>();
+
+    if (sensorArrangement == "rggb")
+        ctx->cfa = {{0, 1, 1, 2}};
+    else if (sensorArrangement == "bggr")
+        ctx->cfa = {{2, 1, 1, 0}};
+    else if (sensorArrangement == "grbg")
+        ctx->cfa = {{1, 0, 2, 1}};
+    else if (sensorArrangement == "gbrg")
+        ctx->cfa = {{1, 2, 0, 1}};
+    else
+        ctx->cfa = {{0, 1, 1, 2}};
+
+    if (ctx->containerMetadata.contains("orientation"))
+    {
+        ctx->orientation = uint16_t(ctx->containerMetadata["orientation"].get<int>());
+    }
+}
+
+static std::string frameName(int i)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "frame_%06d.dng", i);
+    return buf;
+}
+
+// decode one frame into frameCache[path]
+// after writing to cache, if this is the first frame, record its size
+static int load_frame(FSContext *ctx, const std::string &path)
+{
+    // fast‐path if cached
+    if (ctx->frameCache.count(path))
+        return 0;
+
+    // find the frame index
+    int idx = -1;
+    for (size_t i = 0; i < ctx->filenames.size(); ++i)
+        if (ctx->filenames[i] == path)
+        {
+            idx = int(i);
+            break;
+        }
+    if (idx < 0)
+        return -ENOENT;
+
+    // decode raw + per‐frame metadata
+    std::vector<uint16_t> raw;
+    nlohmann::json metadata;
+    try
+    {
+        auto ts = ctx->frameList[idx];
+        ctx->decoder->loadFrame(ts, raw, metadata);
+    }
+    catch (std::exception &e)
+    {
+        std::cerr << "EIO error: " << e.what() << "\n";
+        return -EIO;
+    }
+
+    // pack into a DNGImage
+    tinydngwriter::DNGImage dng;
     const unsigned int width = metadata["width"];
     const unsigned int height = metadata["height"];
-    
     std::vector<float> asShotNeutral = metadata["asShotNeutral"];
-
-    std::vector<uint16_t> blackLevel = containerMetadata["blackLevel"];
-    double whiteLevel = containerMetadata["whiteLevel"];
-    std::string sensorArrangement = containerMetadata["sensorArrangment"];
-    std::vector<float> colorMatrix1 = containerMetadata["colorMatrix1"];
-    std::vector<float> colorMatrix2 = containerMetadata["colorMatrix2"];
-    std::vector<float> forwardMatrix1 = containerMetadata["forwardMatrix1"];
-    std::vector<float> forwardMatrix2 = containerMetadata["forwardMatrix2"];
-
-    // Create first frame
-    tinydngwriter::DNGImage dng;
-
     dng.SetBigEndian(false);
     dng.SetDNGVersion(1, 4, 0, 0);
     dng.SetDNGBackwardVersion(1, 1, 0, 0);
-    dng.SetImageData(reinterpret_cast<const unsigned char*>(data.data()), data.size());
+    dng.SetImageData(
+        (const unsigned char *)raw.data(),
+        raw.size());
     dng.SetImageWidth(width);
     dng.SetImageLength(height);
     dng.SetPlanarConfig(tinydngwriter::PLANARCONFIG_CONTIG);
@@ -87,24 +191,11 @@ void writeDng(
     dng.SetCFARepeatPatternDim(2, 2);
     
     dng.SetBlackLevelRepeatDim(2, 2);
-    dng.SetBlackLevel(4, blackLevel.data());
-    dng.SetWhiteLevel(whiteLevel);
+    dng.SetBlackLevel(uint32_t(ctx->blackLevels.size()), ctx->blackLevels.data());
+    dng.SetWhiteLevel(ctx->whiteLevel);
     dng.SetCompression(tinydngwriter::COMPRESSION_NONE);
 
-    std::vector<uint8_t> cfa;
-    
-    if(sensorArrangement == "rggb")
-        cfa = { 0, 1, 1, 2 };
-    else if(sensorArrangement == "bggr")
-        cfa = { 2, 1, 1, 0 };
-    else if(sensorArrangement == "grbg")
-        cfa = { 1, 0, 2, 1 };
-    else if(sensorArrangement == "gbrg")
-        cfa = { 1, 2, 0, 1 };
-    else
-        throw std::runtime_error("Invalid sensor arrangement");
-
-    dng.SetCFAPattern(4, cfa.data());
+    dng.SetCFAPattern(4, ctx->cfa.data());
     
     // Rectangular
     dng.SetCFALayout(1);
@@ -112,11 +203,11 @@ void writeDng(
     const uint16_t bps[1] = { 16 };
     dng.SetBitsPerSample(1, bps);
     
-    dng.SetColorMatrix1(3, colorMatrix1.data());
-    dng.SetColorMatrix2(3, colorMatrix2.data());
+    dng.SetColorMatrix1(3, ctx->colorMatrix1.data());
+    dng.SetColorMatrix2(3, ctx->colorMatrix2.data());
 
-    dng.SetForwardMatrix1(3, forwardMatrix1.data());
-    dng.SetForwardMatrix2(3, forwardMatrix2.data());
+    dng.SetForwardMatrix1(3, ctx->forwardMatrix1.data());
+    dng.SetForwardMatrix2(3, ctx->forwardMatrix2.data());
     
     dng.SetAsShotNeutral(3, asShotNeutral.data());
     
@@ -128,76 +219,316 @@ void writeDng(
     
     const uint32_t activeArea[4] = { 0, 0, height, width };
     dng.SetActiveArea(&activeArea[0]);
+    if (ctx->orientation) {
+        dng.SetOrientation(ctx->orientation);
+    }
 
     // Write DNG
     std::string err;
     tinydngwriter::DNGWriter writer(false);
-
     writer.AddImage(&dng);
+    std::ostringstream oss;
+    if (!writer.WriteToFile(oss, &err))
+    {
+        std::cerr << "DNG pack error: " << err << "\n";
+        return -EIO;
+    }
 
-    writer.WriteToFile(outputPath.c_str(), &err);
+    // insert into rolling‐buffer cache
+    if (ctx->frameCache.size() >= FSContext::MAX_CACHE_FRAMES)
+    {
+        ctx->frameCache.erase(ctx->frameCacheOrder.front());
+        ctx->frameCacheOrder.pop_front();
+    }
+    ctx->frameCache[path] = oss.str();
+    ctx->frameCacheOrder.push_back(path);
+
+    // record frame‐size once
+    if (ctx->frameSize == 0)
+    {
+        ctx->frameSize = ctx->frameCache[path].size();
+    }
+
+    return 0;
 }
 
-int main(int argc, const char * argv[]) {
-    if(argc < 2) {
-        std::cout << "Usage: decoder <input file> [-n number of frames to export]" << std::endl;
-        return -1;
-    }
-    
-    std::string inputPath(argv[1]);
-    int endFrame = -1;
-    
-    if(argc > 3) {
-        if(std::string(argv[2]) == "-n")
-            endFrame = std::stoi(argv[3]);
+// report uniform size (0 until we have it)
+static int fs_getattr(const char *path, struct stat *st)
+{
+    // path == "/"                -> root
+    // path == "/<base>"          -> directory for each mcraw
+    // path == "/<base>/<frame>"  -> file
+    std::string p(path);
+    memset(st, 0, sizeof(*st));
+
+    if (p == "/") {
+        st->st_mode = S_IFDIR | 0555;
+        st->st_nlink = 2;
+        return 0;
     }
 
-    // Write DNG
-    try {
-        motioncam::Decoder d(inputPath);
-        
-        auto frames = d.getFrames();
-        auto containerMetadata = d.getContainerMetadata();
-        char path[32];
+    // strip leading "/"
+    std::string rest = p.substr(1);
+    auto slash = rest.find('/');
+    if (slash == std::string::npos) {
+        // first‐level entry must be one of the mcraw basenames
+        if (contexts.count(rest)) {
+            st->st_mode = S_IFDIR | 0555;
+            st->st_nlink = 2;
+            return 0;
+        }
+        return -ENOENT;
+    }
 
-        std::cout << "Found " << frames.size() << " frames" << std::endl;
-        
-        if(endFrame < 0)
-            endFrame = static_cast<int>(frames.size());
-        
-        //
-        // Write audio
-        //
-        
-        std::vector<motioncam::AudioChunk> audioChunks;
-        
-        d.loadAudio(audioChunks);
-        
-        writeAudio("audio.wav", d.audioSampleRateHz(), d.numAudioChannels(), audioChunks);
-        
-        //
-        // Write video
-        //
-        
-        std::vector<uint16_t> data;
-        nlohmann::json metadata;
-        
-        endFrame = std::min(static_cast<int>(frames.size()), std::max(0, endFrame));
-        
-        for(int i = 0; i < endFrame; i++) {
-            d.loadFrame(frames[i], data, metadata);
-                        
-            std::snprintf(path, sizeof(path), "frame_%06d.dng", i);
-            
-            std::cout << "Writing " << path << std::endl;
-            
-            writeDng(std::string(path), data, metadata, containerMetadata);
+    // deeper: must be a frame file in that context
+    std::string base = rest.substr(0, slash);
+    std::string fname = rest.substr(slash + 1);
+    auto it = contexts.find(base);
+    if (it == contexts.end())
+        return -ENOENT;
+    FSContext &ctx = it->second;
+
+    // if they asked for "audio.wav"
+    if (fname == "audio.wav") {
+        if (ctx.audioSize == 0)
+            return -ENOENT;
+        st->st_mode = S_IFREG | 0444;
+        st->st_nlink = 1;
+        st->st_size = (off_t)ctx.audioSize;
+        return 0;
+    }
+
+    // else must be one of the frame DNGs
+    if (std::find(ctx.filenames.begin(), ctx.filenames.end(), fname) == ctx.filenames.end())
+        return -ENOENT;
+
+    st->st_mode = S_IFREG | 0444;
+    st->st_nlink = 1;
+    st->st_size = (off_t)ctx.frameSize;
+    return 0;
+}
+
+static int fs_readdir(const char *path, void *buf,
+                      fuse_fill_dir_t filler,
+                      off_t offset, struct fuse_file_info *fi)
+{
+    std::string p(path);
+    (void)offset; (void)fi;
+
+    if (p == "/") {
+        filler(buf, ".", nullptr, 0);
+        filler(buf, "..", nullptr, 0);
+        for (auto &kv : contexts) {
+            filler(buf, kv.first.c_str(), nullptr, 0);
+        }
+        return 0;
+    }
+
+    // strip leading "/"
+    std::string rest = p.substr(1);
+    // must be a context directory
+    auto it = contexts.find(rest);
+    if (it == contexts.end())
+        return -ENOENT;
+    FSContext &ctx = it->second;
+
+    filler(buf, ".", nullptr, 0);
+    filler(buf, "..", nullptr, 0);
+
+    // list frames
+    for (auto &f : ctx.filenames)
+        filler(buf, f.c_str(), nullptr, 0);
+
+    // list the audio file
+    if (ctx.audioSize)
+        filler(buf, "audio.wav", nullptr, 0);
+
+    return 0;
+}
+
+static int fs_open(const char *path, struct fuse_file_info *fi)
+{
+    std::string p(path);
+    // must be /<base>/<frame>
+    if (p.size() < 2 || p[0] != '/')
+        return -ENOENT;
+    std::string rest = p.substr(1);
+    auto slash = rest.find('/');
+    if (slash == std::string::npos)
+        return -EISDIR; // it's a directory, not a file
+
+    std::string base = rest.substr(0, slash);
+    std::string fname = rest.substr(slash + 1);
+    auto it = contexts.find(base);
+    if (it == contexts.end())
+        return -ENOENT;
+    FSContext &ctx = it->second;
+
+    // allow read‐only audio.wav
+    if (fname == "audio.wav") {
+        return (fi->flags & 3) == O_RDONLY ? 0 : -EACCES;
+    }
+
+    // otherwise fall through to DNG frames
+    if (std::find(ctx.filenames.begin(), ctx.filenames.end(), fname) == ctx.filenames.end())
+        return -ENOENT;
+    if ((fi->flags & 3) != O_RDONLY)
+        return -EACCES;
+    return 0;
+}
+
+static int fs_read(const char *path,
+                   char *buf,
+                   size_t size,
+                   off_t offset,
+                   struct fuse_file_info *fi)
+{
+    (void)fi;
+    std::string p(path);
+    // parse "/<base>/<frame>"
+    std::string rest = p.substr(1);
+    auto slash = rest.find('/');
+    if (slash == std::string::npos)
+        return -EISDIR;
+
+    std::string base = rest.substr(0, slash);
+    std::string fname = rest.substr(slash + 1);
+    auto it = contexts.find(base);
+    if (it == contexts.end())
+        return -ENOENT;
+    FSContext &ctx = it->second;
+
+    // if it's the audio.wav, serve the buffer
+    if (fname == "audio.wav") {
+        if ((size_t)offset >= ctx.audioSize)
+            return 0;
+        size_t tocopy = std::min<size_t>(size, ctx.audioSize - (size_t)offset);
+        memcpy(buf, ctx.audioWavData.data() + offset, tocopy);
+        return (ssize_t)tocopy;
+    }
+
+    // otherwise decode & serve a frame
+    int err = load_frame(&ctx, fname);
+    if (err < 0)
+        return err;
+    auto it2 = ctx.frameCache.find(fname);
+    if (it2 == ctx.frameCache.end())
+        return -ENOENT;
+    const std::string &data = it2->second;
+    if ((size_t)offset >= data.size())
+        return 0;
+    size_t tocopy = std::min<size_t>(size, data.size() - (size_t)offset);
+    memcpy(buf, data.data() + offset, tocopy);
+    return (ssize_t)tocopy;
+}
+
+static struct fuse_operations fs_ops = {
+    .getattr = fs_getattr,
+    .readdir = fs_readdir,
+    .open    = fs_open,
+    .read    = fs_read,
+};
+
+int main(int argc, char *argv[])
+{
+    if (argc != 1)
+    {
+        std::cerr << "Usage: " << argv[0];
+        return 1;
+    }
+
+    // 1) find all .mcraw files in current directory
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        std::cerr << "Error: cannot get current directory\n";
+        return 1;
+    }
+
+    DIR *d = opendir(cwd);
+    if (!d) {
+        std::cerr << "Error: cannot open current directory\n";
+        return 1;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != nullptr) {
+        std::string fn = ent->d_name;
+        if (fn.size() > 6 && fn.substr(fn.size()-6) == ".mcraw") {
+            std::string base = fn.substr(0, fn.size()-6);
+            FSContext ctx;
+            try {
+                ctx.decoder = new motioncam::Decoder(fn);
+            } catch (std::exception &e) {
+                std::cerr << "Decoder error ("<<fn<<"): " << e.what() << "\n";
+                continue;
+            }
+            // preload frames + metadata
+            ctx.frameList = ctx.decoder->getFrames();
+            ctx.containerMetadata = ctx.decoder->getContainerMetadata();
+            cache_container_metadata(&ctx);
+            std::cerr << "DEBUG: ["<<fn<<"] found " << ctx.frameList.size() << " frames\n";
+            for (size_t i = 0; i < ctx.frameList.size(); ++i)
+                ctx.filenames.push_back(frameName(int(i)));
+            // warm up first frame
+            if (!ctx.filenames.empty())
+                load_frame(&ctx, ctx.filenames[0]);
+
+            // ------------------------------------------------------------------
+            // extract & build WAV in memory from the decoder’s audio
+            // ------------------------------------------------------------------
+            try {
+                std::vector<motioncam::AudioChunk> audioChunks;
+                std::vector<uint8_t> fileData;
+                ctx.decoder->loadAudio(audioChunks);
+                int sampleRate   = ctx.decoder->audioSampleRateHz();
+                int numChannels  = ctx.decoder->numAudioChannels();
+                auto wavBytes    = getAudio(fileData, sampleRate, numChannels, audioChunks);
+                ctx.audioWavData.assign(fileData.begin(), fileData.end());
+                ctx.audioSize = ctx.audioWavData.size();
+            }
+            catch (std::exception &e) {
+                std::cerr << "Audio processing error ("<<fn<<"): " << e.what() << "\n";
+            }
+            // ------------------------------------------------------------------
+
+            contexts.emplace(base, std::move(ctx));
         }
     }
-    catch(motioncam::MotionCamException& e) {
-        std::cerr << "Error: " << e.what( )<< std::endl;
-        return -1;
+    closedir(d);
+
+    if (contexts.empty()) {
+        std::cerr << "No .mcraw files found in current directory\n";
+        return 1;
     }
-    
-    return 0;
+
+    // 2) ensure mount-point directory exists
+    std::string mountPoint = "mcraws";
+    if (::mkdir(mountPoint.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::cerr << "Error creating mountpoint '" << mountPoint
+                  << "': " << strerror(errno) << "\n";
+        return 1;
+    }
+
+    // 3) assemble the same FUSE flags/options as original
+    std::string volname = mountPoint.substr(mountPoint.find_last_of('/') + 1);
+    std::string mountOptions =
+        "iosize=8388608,"
+        "noappledouble,"
+        "nobrowse,"
+        "rdonly,"
+        "noapplexattr,"
+        "volname=" + volname;
+
+    int fuse_argc = 6;
+    char *fuse_argv[7];
+    fuse_argv[0] = argv[0];
+    fuse_argv[1] = (char*)"-f";  // foreground
+    fuse_argv[2] = (char*)"-s";  // single-threaded
+    fuse_argv[3] = (char*)"-o";  // mount options
+    fuse_argv[4] = (char*)mountOptions.c_str();
+    fuse_argv[5] = (char*)mountPoint.c_str();  // mount-point
+    fuse_argv[6] = nullptr;
+
+    // 4) run FUSE
+    return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
 }
