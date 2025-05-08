@@ -31,6 +31,8 @@
 #include <libgen.h>   // for dirname(), basename()
 #include <sys/stat.h> // for mkdir
 #include <errno.h>
+#include <dirent.h>   // for scanning directory
+#include <limits.h>   // for PATH_MAX
 
 #include <motioncam/Decoder.hpp>
 #include <audiofile/AudioFile.h>
@@ -88,6 +90,8 @@ struct FSContext {
         forwardMatrix2;
 };
 
+static std::map<std::string, FSContext> contexts;
+
 // call this once, right after containerMetadata is set:
 static void cache_container_metadata(FSContext *ctx)
 {
@@ -134,12 +138,11 @@ static std::string frameName(int i)
 
 // decode one frame into frameCache[path]
 // after writing to cache, if this is the first frame, record its size
-static int load_frame(const std::string &path, FSContext *ctx)
+static int load_frame(FSContext *ctx, const std::string &path)
 {
-    { // fast‐path if cached
-        if (ctx->frameCache.count(path))
-            return 0;
-    }
+    // fast‐path if cached
+    if (ctx->frameCache.count(path))
+        return 0;
 
     // find the frame index
     int idx = -1;
@@ -230,22 +233,18 @@ static int load_frame(const std::string &path, FSContext *ctx)
     }
 
     // insert into rolling‐buffer cache
+    if (ctx->frameCache.size() >= FSContext::MAX_CACHE_FRAMES)
     {
-        if (ctx->frameCache.size() >= FSContext::MAX_CACHE_FRAMES)
-        {
-            ctx->frameCache.erase(ctx->frameCacheOrder.front());
-            ctx->frameCacheOrder.pop_front();
-        }
-        ctx->frameCache[path] = oss.str();
-        ctx->frameCacheOrder.push_back(path);
+        ctx->frameCache.erase(ctx->frameCacheOrder.front());
+        ctx->frameCacheOrder.pop_front();
     }
+    ctx->frameCache[path] = oss.str();
+    ctx->frameCacheOrder.push_back(path);
 
     // record frame‐size once
+    if (ctx->frameSize == 0)
     {
-        if (ctx->frameSize == 0)
-        {
-            ctx->frameSize = ctx->frameCache[path].size();
-        }
+        ctx->frameSize = ctx->frameCache[path].size();
     }
 
     return 0;
@@ -254,23 +253,44 @@ static int load_frame(const std::string &path, FSContext *ctx)
 // report uniform size (0 until we have it)
 static int fs_getattr(const char *path, struct stat *st)
 {
-    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
-    std::cout << "fs_getattr";
-    std::cout << path;
-    std::cout << "\n";
+    // path == "/"                -> root
+    // path == "/<base>"          -> directory for each mcraw
+    // path == "/<base>/<frame>"  -> file
+    std::string p(path);
     memset(st, 0, sizeof(*st));
-    if (strcmp(path, "/") == 0)
-    {
+
+    if (p == "/") {
         st->st_mode = S_IFDIR | 0555;
         st->st_nlink = 2;
         return 0;
     }
 
+    // strip leading "/"
+    std::string rest = p.substr(1);
+    auto slash = rest.find('/');
+    if (slash == std::string::npos) {
+        // first‐level entry must be one of the mcraw basenames
+        if (contexts.count(rest)) {
+            st->st_mode = S_IFDIR | 0555;
+            st->st_nlink = 2;
+            return 0;
+        }
+        return -ENOENT;
+    }
+
+    // deeper: must be a frame file in that context
+    std::string base = rest.substr(0, slash);
+    std::string fname = rest.substr(slash + 1);
+    auto it = contexts.find(base);
+    if (it == contexts.end())
+        return -ENOENT;
+    FSContext &ctx = it->second;
+    if (std::find(ctx.filenames.begin(), ctx.filenames.end(), fname) == ctx.filenames.end())
+        return -ENOENT;
+
     st->st_mode = S_IFREG | 0444;
     st->st_nlink = 1;
-    {
-        st->st_size = (off_t)ctx->frameSize;
-    }
+    st->st_size = (off_t)ctx.frameSize;
     return 0;
 }
 
@@ -278,59 +298,88 @@ static int fs_readdir(const char *path, void *buf,
                       fuse_fill_dir_t filler,
                       off_t offset, struct fuse_file_info *fi)
 {
-    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
-    std::cout << "fs_readdir";
-    std::cout << path;
-    std::cout << "\n";
-    (void)offset;
-    (void)fi;
-    if (strcmp(path, "/") != 0)
+    std::string p(path);
+    (void)offset; (void)fi;
+
+    if (p == "/") {
+        filler(buf, ".", nullptr, 0);
+        filler(buf, "..", nullptr, 0);
+        for (auto &kv : contexts) {
+            filler(buf, kv.first.c_str(), nullptr, 0);
+        }
+        return 0;
+    }
+
+    // strip leading "/"
+    std::string rest = p.substr(1);
+    // must be a context directory
+    auto it = contexts.find(rest);
+    if (it == contexts.end())
         return -ENOENT;
+    FSContext &ctx = it->second;
+
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
-    for (auto &f : ctx->filenames)
+    for (auto &f : ctx.filenames)
         filler(buf, f.c_str(), nullptr, 0);
     return 0;
 }
 
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
-    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
-    std::cout << "fs_open" << path << "\n";
-    std::string fn = path + 1;
-    if (std::find(ctx->filenames.begin(), ctx->filenames.end(), fn) == ctx->filenames.end())
+    std::string p(path);
+    // must be /<base>/<frame>
+    if (p.size() < 2 || p[0] != '/')
+        return -ENOENT;
+    std::string rest = p.substr(1);
+    auto slash = rest.find('/');
+    if (slash == std::string::npos)
+        return -EISDIR; // it's a directory, not a file
+
+    std::string base = rest.substr(0, slash);
+    std::string fname = rest.substr(slash + 1);
+    auto it = contexts.find(base);
+    if (it == contexts.end())
+        return -ENOENT;
+    FSContext &ctx = it->second;
+    if (std::find(ctx.filenames.begin(), ctx.filenames.end(), fname) == ctx.filenames.end())
         return -ENOENT;
     if ((fi->flags & 3) != O_RDONLY)
         return -EACCES;
-
     return 0;
 }
 
-// do the expensive decoding here, once per file
 static int fs_read(const char *path,
                    char *buf,
                    size_t size,
                    off_t offset,
                    struct fuse_file_info *fi)
 {
-    FSContext *ctx = static_cast<FSContext*>(fuse_get_context()->private_data);
     (void)fi;
-    std::cout << "fs_read" << path << "\n";
+    std::string p(path);
+    // parse "/<base>/<frame>"
+    std::string rest = p.substr(1);
+    auto slash = rest.find('/');
+    if (slash == std::string::npos)
+        return -EISDIR;
 
-    std::string fn = path + 1;
+    std::string base = rest.substr(0, slash);
+    std::string fname = rest.substr(slash + 1);
+    auto it = contexts.find(base);
+    if (it == contexts.end())
+        return -ENOENT;
+    FSContext &ctx = it->second;
 
-    // 1) trigger the lazy‐decode if we haven't already cached it
-    int err = load_frame(fn, ctx);
+    // 1) trigger decode if needed
+    int err = load_frame(&ctx, fname);
     if (err < 0)
         return err;
 
-    // 2) we know it's in cache now; copy out the bytes
+    auto it2 = ctx.frameCache.find(fname);
+    if (it2 == ctx.frameCache.end())
+        return -ENOENT;
 
-    auto it = ctx->frameCache.find(fn);
-    if (it == ctx->frameCache.end())
-        return -ENOENT; // should never happen, load_frame just inserted it
-
-    const std::string &data = it->second;
+    const std::string &data = it2->second;
     if ((size_t)offset >= data.size())
         return 0;
 
@@ -342,93 +391,92 @@ static int fs_read(const char *path,
 static struct fuse_operations fs_ops = {
     .getattr = fs_getattr,
     .readdir = fs_readdir,
-    .open = fs_open,
-    .read = fs_read,
+    .open    = fs_open,
+    .read    = fs_read,
 };
 
 int main(int argc, char *argv[])
 {
-    if (argc != 2)
+    if (argc != 1)
     {
-        std::cerr << "Usage: " << argv[0]
-                  << " <input.motioncam>\n";
+        std::cerr << "Usage: " << argv[0];
         return 1;
     }
 
-    FSContext ctx;
+    // 1) find all .mcraw files in current directory
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        std::cerr << "Error: cannot get current directory\n";
+        return 1;
+    }
 
-    // 1) figure out mount‐point directory: same folder, same basename (no .mcraw)
-    std::string inputPath = argv[1];
-    // make writable copies for dirname()/basename()
-    char *dup1 = strdup(inputPath.c_str());
-    char *dup2 = strdup(inputPath.c_str());
+    DIR *d = opendir(cwd);
+    if (!d) {
+        std::cerr << "Error: cannot open current directory\n";
+        return 1;
+    }
 
-    std::string parentDir = dirname(dup1); // e.g. "/foo/bar"
-    std::string fileName = basename(dup2); // e.g. "video.mcraw"
+    struct dirent *ent;
+    while ((ent = readdir(d)) != nullptr) {
+        std::string fn = ent->d_name;
+        if (fn.size() > 6 && fn.substr(fn.size()-6) == ".mcraw") {
+            std::string base = fn.substr(0, fn.size()-6);
+            FSContext ctx;
+            try {
+                ctx.decoder = new motioncam::Decoder(fn);
+            } catch (std::exception &e) {
+                std::cerr << "Decoder error ("<<fn<<"): " << e.what() << "\n";
+                continue;
+            }
+            // preload
+            ctx.frameList = ctx.decoder->getFrames();
+            ctx.containerMetadata = ctx.decoder->getContainerMetadata();
+            cache_container_metadata(&ctx);
+            std::cerr << "DEBUG: ["<<fn<<"] found " << ctx.frameList.size() << " frames\n";
+            for (size_t i = 0; i < ctx.frameList.size(); ++i)
+                ctx.filenames.push_back(frameName(int(i)));
+            // warm up first frame
+            if (!ctx.filenames.empty())
+                load_frame(&ctx, ctx.filenames[0]);
 
-    free(dup1);
-    free(dup2);
+            contexts.emplace(base, std::move(ctx));
+        }
+    }
+    closedir(d);
 
-    // strip extension from filename
-    std::string base = fileName;
-    auto dot = base.rfind('.');
-    if (dot != std::string::npos)
-        base.erase(dot);
+    if (contexts.empty()) {
+        std::cerr << "No .mcraw files found in current directory\n";
+        return 1;
+    }
 
-    // assemble mount‐point path
-    std::string mountPoint = parentDir + "/" + base;
-
-    // create the directory if it doesn't exist
-    if (::mkdir(mountPoint.c_str(), 0755) != 0 && errno != EEXIST)
-    {
+    // 2) ensure mount‐point directory exists
+    std::string mountPoint = "mcraws";
+    if (::mkdir(mountPoint.c_str(), 0755) != 0 && errno != EEXIST) {
         std::cerr << "Error creating mountpoint '" << mountPoint
                   << "': " << strerror(errno) << "\n";
         return 1;
     }
 
-    // 2) open decoder
-    try
-    {
-        ctx.decoder = new motioncam::Decoder(inputPath);
-    }
-    catch (std::exception &e)
-    {
-        std::cerr << "Decoder error: " << e.what() << "\n";
-        return 1;
-    }
+    // 3) assemble the same FUSE flags/options as original
+    std::string volname = mountPoint.substr(mountPoint.find_last_of('/') + 1);
+    std::string mountOptions =
+        "iosize=8388608,"
+        "noappledouble,"
+        "nobrowse,"
+        "rdonly,"
+        "noapplexattr,"
+        "volname=" + volname;
 
-    // 3) preload metadata & frame‐list
-    ctx.frameList = ctx.decoder->getFrames();
-    ctx.containerMetadata = ctx.decoder->getContainerMetadata();
-    cache_container_metadata(&ctx);
-
-    std::cerr << "DEBUG: found " << ctx.frameList.size() << " frames\n";
-    for (size_t i = 0; i < ctx.frameList.size(); ++i)
-        ctx.filenames.push_back(frameName(int(i)));
-
-    // 4) warm up first frame so frameSize is known
-    if (!ctx.filenames.empty())
-    {
-        if (int err = load_frame(ctx.filenames[0], &ctx); err < 0)
-        {
-            std::cerr << "Failed to load first frame: " << err << "\n";
-            return 1;
-        }
-    }
-
-    // 5) build FUSE argv and run
     int fuse_argc = 6;
     char *fuse_argv[7];
     fuse_argv[0] = argv[0];
-    fuse_argv[1] = (char *)"-f";
-    fuse_argv[2] = (char *)"-s";
-    fuse_argv[3] = (char *)"-o";
-    std::string last = mountPoint.substr(mountPoint.find_last_of('/') + 1);
-    std::string mountOptions = "iosize=8388608,noappledouble,nobrowse,rdonly,noapplexattr,volname=" + last;
-    fuse_argv[4] = (char *)mountOptions.c_str();
-    // finally, our auto‐created mountpoint:
-    fuse_argv[5] = const_cast<char *>(mountPoint.c_str());
+    fuse_argv[1] = (char*)"-f";  // foreground
+    fuse_argv[2] = (char*)"-s";  // single‐threaded
+    fuse_argv[3] = (char*)"-o";  // mount options
+    fuse_argv[4] = (char*)mountOptions.c_str();
+    fuse_argv[5] = (char*)mountPoint.c_str();  // mount‐point
     fuse_argv[6] = nullptr;
 
-    return fuse_main(fuse_argc, fuse_argv, &fs_ops, &ctx);
+    // 4) run FUSE
+    return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
 }
