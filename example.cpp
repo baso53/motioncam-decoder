@@ -21,7 +21,6 @@
 #include <string>
 #include <map>
 #include <deque>
-#include <mutex>
 #include <algorithm>
 #include <sstream>
 #include <iostream>
@@ -74,12 +73,9 @@ static motioncam::Decoder *decoder = nullptr;
 static nlohmann::json containerMetadata;
 static std::vector<std::string> filenames;
 static std::map<std::string, std::string> frameCache;
-static std::mutex frameCacheMutex;
 static const size_t MAX_CACHE_FRAMES = 10;
 static std::deque<std::string> frameCacheOrder;
 static size_t frameSize = 0;
-static std::mutex frameSizeMutex;
-static std::mutex decoderMutex;
 static std::vector<motioncam::Timestamp> frameList;
 
 // container globals
@@ -141,7 +137,6 @@ static std::string frameName(int i)
 static int load_frame(const std::string &path)
 {
     { // fast‐path if cached
-        std::lock_guard<std::mutex> lk(frameCacheMutex);
         if (frameCache.count(path))
             return 0;
     }
@@ -163,7 +158,6 @@ static int load_frame(const std::string &path)
     try
     {
         auto ts = frameList[idx];
-        std::lock_guard<std::mutex> dlk(decoderMutex);
         decoder->loadFrame(ts, raw, metadata);
     }
     catch (std::exception &e)
@@ -237,7 +231,6 @@ static int load_frame(const std::string &path)
 
     // insert into rolling‐buffer cache
     {
-        std::lock_guard<std::mutex> lk(frameCacheMutex);
         if (frameCache.size() >= MAX_CACHE_FRAMES)
         {
             frameCache.erase(frameCacheOrder.front());
@@ -249,10 +242,8 @@ static int load_frame(const std::string &path)
 
     // record frame‐size once
     {
-        std::lock_guard<std::mutex> lk(frameSizeMutex);
         if (frameSize == 0)
         {
-            std::lock_guard<std::mutex> lk2(frameCacheMutex);
             frameSize = frameCache[path].size();
         }
     }
@@ -277,7 +268,6 @@ static int fs_getattr(const char *path, struct stat *st)
     st->st_mode = S_IFREG | 0444;
     st->st_nlink = 1;
     {
-        std::lock_guard<std::mutex> lk(frameSizeMutex);
         st->st_size = (off_t)frameSize;
     }
     return 0;
@@ -331,7 +321,7 @@ static int fs_read(const char *path,
         return err;
 
     // 2) we know it's in gCache now; copy out the bytes
-    std::lock_guard<std::mutex> lk(frameCacheMutex);
+
     auto it = frameCache.find(fn);
     if (it == frameCache.end())
         return -ENOENT; // should never happen, load_frame just inserted it
