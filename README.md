@@ -1,4 +1,4 @@
-# MotionCam MCRAW Decoder and FUSE Filesystem
+# MotionCam MCRAW mounter with a FUSE Filesystem
 
 A FUSE-based virtual filesystem that mounts all `.mcraw` files in the current directory, exposing each frame as a DNG and the audio as `audio.wav`.
 
