@@ -564,8 +564,9 @@ int main(int argc, char *argv[])
     // 4) run FUSE
     int ret = fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
 
+    std::cout << "Exit code: " << ret;
     if (::rmdir(mountPoint.c_str()) != 0)
-        std::cerr << "cleanup_mount(): rmdir(\"" << mountPoint
+        std::cerr << "cleanup_mount: rmdir(\"" << mountPoint
               << "\") failed: " << strerror(errno) << "\n";
 
     return ret;

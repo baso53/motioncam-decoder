@@ -36,8 +36,8 @@ add_library(motioncam_decoder lib/Decoder.cpp lib/RawData.cpp lib/RawData_Legacy
 set_property(TARGET motioncam_decoder PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------
-# 4) Our example executable
+# 4) Our mcraw-mounter-fuse executable
 # ---------------------------------------------------------------
-add_executable(example example.cpp)
+add_executable(mcraw-mounter-fuse mcraw-mounter-fuse.cpp)
 
-target_link_libraries(example PRIVATE motioncam_decoder ${LIBFUSE2_LIBRARIES})
+target_link_libraries(mcraw-mounter-fuse PRIVATE motioncam_decoder ${LIBFUSE2_LIBRARIES})

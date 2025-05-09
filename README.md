@@ -54,7 +54,7 @@ A FUSE-based virtual filesystem that mounts all `.mcraw` files in the current di
    make
    ```
    This produces one binary:
-   - `example`
+   - `mcraw-mounter-fuse`
 
 ---
 
@@ -73,7 +73,7 @@ mcraws/
 
 ### How It Works
 
-1. On startup, `mcraw-decoder` scans the folder where the application is run from for all `.mcraw` files.  
+1. On startup, `mcraw-mounter-fuse` scans the folder where the application is run from for all `.mcraw` files.  
 2. For each file it creates an in-memory context:
    - Loads container metadata (black/white levels, CFA pattern, matrices, orientation)  
    - Builds a list of frame timestamps  
@@ -86,7 +86,7 @@ mcraws/
 ### Usage
 
 ```bash
-./mcraw-decoder
+./mcraw-mounter-fuse
 # DEBUG: [007-VIDEO_...0.mcraw] found N frames
 # Mounts at ./mcraws
 ```
