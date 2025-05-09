@@ -561,6 +561,12 @@ int main(int argc, char *argv[])
     fuse_argv[5] = (char*)mountPoint.c_str();
     fuse_argv[6] = nullptr;
 
-    // 5) run FUSE loop
-    return fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
+    // 4) run FUSE
+    int ret = fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
+
+    if (::rmdir(mountPoint.c_str()) != 0)
+        std::cerr << "cleanup_mount(): rmdir(\"" << mountPoint
+              << "\") failed: " << strerror(errno) << "\n";
+
+    return ret;
 }
