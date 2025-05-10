@@ -91,6 +91,8 @@ struct FSContext {
         forwardMatrix2;
     std::vector<uint8_t> audioWavData;
     size_t               audioSize = 0;
+
+    std::string baseName;
 };
 
 static std::map<std::string, FSContext> contexts;
@@ -132,10 +134,10 @@ static void cache_container_metadata(FSContext *ctx)
     }
 }
 
-static std::string frameName(int i)
+static std::string frameName(const std::string &base, int i)
 {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "frame_%06d.dng", i);
+    char buf[PATH_MAX];
+    std::snprintf(buf, sizeof(buf), "%s_%06d.dng", base.c_str(), i);
     return buf;
 }
 
@@ -289,8 +291,9 @@ static int fs_getattr(const char *path, struct stat *st)
         return -ENOENT;
     FSContext &ctx = it->second;
 
-    // if they asked for "audio.wav"
-    if (fname == "audio.wav") {
+    // if they asked for "<base>.wav"
+    std::string audioName = ctx.baseName + ".wav";
+    if (fname == audioName) {
         if (ctx.audioSize == 0)
             return -ENOENT;
         st->st_mode = S_IFREG | 0444;
@@ -341,8 +344,10 @@ static int fs_readdir(const char *path, void *buf,
         filler(buf, f.c_str(), nullptr, 0);
 
     // list the audio file
-    if (ctx.audioSize)
-        filler(buf, "audio.wav", nullptr, 0);
+    if (ctx.audioSize) {
+        std::string audioName = ctx.baseName + ".wav";
+        filler(buf, audioName.c_str(), nullptr, 0);
+    }
 
     return 0;
 }
@@ -366,7 +371,8 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
     FSContext &ctx = it->second;
 
     // allow read‐only audio.wav
-    if (fname == "audio.wav") {
+    std::string audioName = ctx.baseName + ".wav";
+    if (fname == audioName) {
         return (fi->flags & 3) == O_RDONLY ? 0 : -EACCES;
     }
 
@@ -399,8 +405,9 @@ static int fs_read(const char *path,
         return -ENOENT;
     FSContext &ctx = it->second;
 
-    // if it's the audio.wav, serve the buffer
-    if (fname == "audio.wav") {
+    // if it's the wav file, serve the buffer
+    std::string audioName = ctx.baseName + ".wav";
+    if (fname == audioName) {
         if ((size_t)offset >= ctx.audioSize)
             return 0;
         size_t tocopy = std::min<size_t>(size, ctx.audioSize - (size_t)offset);
@@ -467,6 +474,7 @@ int main(int argc, char *argv[])
             std::cout << "Found file: " << fullPath << "\n";
 
             FSContext ctx;
+            ctx.baseName = baseName;
             try {
                 // pass the absolute path into the decoder
                 ctx.decoder = new motioncam::Decoder(fullPath);
@@ -487,7 +495,7 @@ int main(int argc, char *argv[])
 
             // prepare filename list
             for (size_t i = 0; i < ctx.frameList.size(); ++i) {
-                ctx.filenames.push_back(frameName(int(i)));
+                ctx.filenames.push_back(frameName(baseName, int(i)));
             }
 
             // warm up first frame
