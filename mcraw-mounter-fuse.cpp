@@ -127,11 +127,6 @@ static void cache_container_metadata(FSContext *ctx)
         ctx->cfa = {{1, 2, 0, 1}};
     else
         ctx->cfa = {{0, 1, 1, 2}};
-
-    if (ctx->containerMetadata.contains("orientation"))
-    {
-        ctx->orientation = uint16_t(ctx->containerMetadata["orientation"].get<int>());
-    }
 }
 
 static std::string frameName(const std::string &base, int i)
@@ -176,6 +171,7 @@ static int load_frame(FSContext *ctx, const std::string &path)
 
     // pack into a DNGImage
     tinydngwriter::DNGImage dng;
+    dng.SetCustomFieldLong(0x23, 23);
     const unsigned int width = metadata["width"];
     const unsigned int height = metadata["height"];
     std::vector<float> asShotNeutral = metadata["asShotNeutral"];
