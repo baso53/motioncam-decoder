@@ -7,8 +7,6 @@ project(
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O3 -march=armv8-a -mcpu=apple-m1 -funroll-loops -flto")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=armv8-a -mcpu=apple-m1 -funroll-loops -flto")
 
 # Fix fuse.h 32/64bit offset issues
 add_compile_definitions(_FILE_OFFSET_BITS=64)
@@ -17,6 +15,9 @@ add_compile_definitions(_FILE_OFFSET_BITS=64)
 #  Platform‐specific: Linux/Mac us libfuse2 via pkg-config
 # ----------------------------------------------------------------
 if(APPLE)
+  set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O3 -march=armv8-a -mcpu=apple-m1 -funroll-loops -flto")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=armv8-a -mcpu=apple-m1 -funroll-loops -flto")
+
   # 1) Tell pkg-config where to look for .pc files
   set(ENV{PKG_CONFIG_PATH}
       "/usr/local/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
@@ -46,15 +47,9 @@ if(APPLE)
   target_link_libraries(mcraw-mounter-fuse
     PRIVATE motioncam_decoder ${LIBFUSE2_LIBRARIES}
   )
-
-
-# ----------------------------------------------------------------
-#  Platform‐specific: Windows use WinFsp in Program Files (x86) only
-# ----------------------------------------------------------------
 elseif(WIN32)
+
   # 1) Force the “Program Files (x86)” install-root
-  #    (this will expand on a 64-bit host to C:\Program Files (x86)\WinFsp
-  #     and on a 32-bit host to C:\Program Files\WinFsp)
   set(WINFSP_ROOT "$ENV{ProgramFiles\(x86\)}/WinFsp")
 
   # 2) Detect target architecture so we pick the correct .lib/.dll names
@@ -71,6 +66,16 @@ elseif(WIN32)
   endif()
   if(NOT EXISTS "${WINFSP_BIN_DIR}/winfsp-${WINFSP_ARCH}.dll")
     message(FATAL_ERROR "Cannot find winfsp-${WINFSP_ARCH}.dll in ${WINFSP_BIN_DIR}")
+  endif()
+
+  if(MSVC)
+    # Append to the global flags so all targets pick them up
+    set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE}   /O2 /Ob2 /Ot /Oi /Gy /GL /arch:AVX2 /fp:fast")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /Ob2 /Ot /Oi /Gy /GL /arch:AVX2 /fp:fast")
+
+    # Enable linker-time code generation
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE   "${CMAKE_EXE_LINKER_FLAGS_RELEASE}   /LTCG")
+    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /LTCG")
   endif()
 
   # 5) Create our decoder library
