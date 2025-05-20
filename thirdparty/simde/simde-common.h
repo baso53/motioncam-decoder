@@ -26,6 +26,7 @@
  *   2023      Ju-Hung Li <jhlee@pllab.cs.nthu.edu.tw> (Copyright owned by NTHU pllab)
  */
 
+#include <cmath>
 #if !defined(SIMDE_COMMON_H)
 #define SIMDE_COMMON_H
 
