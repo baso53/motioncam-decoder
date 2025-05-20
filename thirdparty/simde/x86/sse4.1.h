@@ -24,6 +24,7 @@
  *   2017-2020 Evan Nemerson <evan@nemerson.com>
  */
 
+#include <cmath>
 #include "sse.h"
 #if !defined(SIMDE_X86_SSE4_1_H)
 #define SIMDE_X86_SSE4_1_H
