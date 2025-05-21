@@ -37,9 +37,10 @@ if(APPLE)
   link_directories(${FUSE_LIBRARY_DIRS})
 
 elseif(WIN32)
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2" CACHE STRING "Release flags" FORCE)
   # hard-coded WinFsp layout
   set(WINFSP_ROOT "C:/Program Files (x86)/WinFsp")
-  set(WINFSP_ARCH a64)
+  set(WINFSP_ARCH x64)
   set(WINFSP_INC  "${WINFSP_ROOT}/inc/fuse")
   set(WINFSP_LIB  "${WINFSP_ROOT}/lib")
   set(WINFSP_BIN  "${WINFSP_ROOT}/bin")
