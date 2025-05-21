@@ -37,14 +37,6 @@ if(APPLE)
   link_directories(${FUSE_LIBRARY_DIRS})
 
 elseif(WIN32)
-  # always optimize on MSVC
-  add_compile_options(
-    "$<$<CXX_COMPILER_ID:MSVC>:/O2 /Ob2 /Ot /Oi /Gy /GL /arch:AVX2 /fp:fast>"
-  )
-  add_link_options(
-    "$<$<CXX_COMPILER_ID:MSVC>:/LTCG>"
-  )
-
   # hard-coded WinFsp layout
   set(WINFSP_ROOT "C:/Program Files (x86)/WinFsp")
   set(WINFSP_ARCH a64)
@@ -85,3 +77,13 @@ target_link_libraries(mcraw-mounter-fuse
     motioncam_decoder
     ${FUSE_LIBS}
 )
+
+if(WIN32)
+    # 7) Copy the DLL next to the .exe
+  add_custom_command(TARGET mcraw-mounter-fuse POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${WINFSP_BIN}/winfsp-${WINFSP_ARCH}.dll"
+      $<TARGET_FILE_DIR:mcraw-mounter-fuse>
+    COMMENT "Copying WinFsp DLL to output folder"
+  )
+endif()
