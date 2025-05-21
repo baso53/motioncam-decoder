@@ -29,6 +29,7 @@
 #include <sys/stat.h>   // for mode constants
 #include <cstring>      // for strerror
 #include <cerrno>       // for errno
+#include <shared_mutex> // for std::shared_mutex
 
 #include <motioncam/Decoder.hpp>
 #include <audiofile/AudioFile.h>
@@ -36,6 +37,16 @@
 #define TINY_DNG_WRITER_IMPLEMENTATION
     #include <tinydng/tiny_dng_writer.h>
 #undef TINY_DNG_WRITER_IMPLEMENTATION
+
+// --- locking infrastructure: fixed array of shared_mutex ---
+static constexpr size_t MUTEX_COUNT = 64;
+static std::array<std::shared_mutex, MUTEX_COUNT> g_mutexes;
+
+inline std::shared_mutex & getMutex(const std::string &key) {
+    size_t h = std::hash<std::string>{}(key);
+    return g_mutexes[h % MUTEX_COUNT];
+}
+// ------------------------------------------------------------
 
 bool getAudio(
     std::vector<uint8_t>& fileData,
@@ -135,11 +146,15 @@ static std::string frameName(const std::string &base, int i)
 // after writing to cache, if this is the first frame, record its size
 static int load_frame(FSContext *ctx, const std::string &path)
 {
-    // fast‐path if cached
-    if (ctx->frameCache.count(path))
-        return 0;
+    // 1) shared‐lock to fast‐path cached read:
+    auto &mtx = getMutex(ctx->baseName);
+    {
+        std::shared_lock<std::shared_mutex> sl(mtx);
+        if (ctx->frameCache.count(path))
+            return 0;
+    }
 
-    // find the frame index
+    // 2) find the frame index
     int idx = -1;
     for (size_t i = 0; i < ctx->filenames.size(); ++i)
         if (ctx->filenames[i] == path)
@@ -149,6 +164,12 @@ static int load_frame(FSContext *ctx, const std::string &path)
         }
     if (idx < 0)
         return -ENOENT;
+
+    // 3) exclusive lock to do the decode + cache insertion:
+    std::unique_lock<std::shared_mutex> ul(mtx);
+    // double‐check
+    if (ctx->frameCache.count(path))
+        return 0;
 
     // decode raw + per‐frame metadata
     std::vector<uint16_t> raw;
@@ -286,7 +307,9 @@ static int fs_getattr(const char *path, struct fuse_stat *st)
         return -ENOENT;
     FSContext &ctx = it->second;
 
-    // if they asked for "<base>.wav"
+    // shared‐lock for read‐only
+    std::shared_lock<std::shared_mutex> sl(getMutex(base));
+
     std::string audioName = ctx.baseName + ".wav";
     if (fname == audioName) {
         if (ctx.audioSize == 0)
@@ -297,7 +320,6 @@ static int fs_getattr(const char *path, struct fuse_stat *st)
         return 0;
     }
 
-    // else must be one of the frame DNGs
     if (std::find(ctx.filenames.begin(), ctx.filenames.end(), fname) == ctx.filenames.end())
         return -ENOENT;
 
@@ -337,6 +359,9 @@ static int fs_readdir(const char *path, void *buf,
         return -ENOENT;
     FSContext &ctx = it->second;
 
+    // shared‐lock
+    std::shared_lock<std::shared_mutex> sl(getMutex(rest));
+
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
 
@@ -359,13 +384,12 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
     # define O_RDONLY 0
     #endif
     std::string p(path);
-    // must be /<base>/<frame>
     if (p.size() < 2 || p[0] != '/')
         return -ENOENT;
     std::string rest = p.substr(1);
     auto slash = rest.find('/');
     if (slash == std::string::npos)
-        return -EISDIR; // it's a directory, not a file
+        return -EISDIR;
 
     std::string base = rest.substr(0, slash);
     std::string fname = rest.substr(slash + 1);
@@ -374,7 +398,9 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
         return -ENOENT;
     FSContext &ctx = it->second;
 
-    // allow read‐only audio.wav
+    // shared‐lock around checking filenames
+    std::shared_lock<std::shared_mutex> sl(getMutex(base));
+
     std::string audioName = ctx.baseName + ".wav";
     if (fname == audioName) {
         return (fi->flags & 3) == O_RDONLY ? 0 : -EACCES;
@@ -404,7 +430,6 @@ static int fs_read(const char *path,
 {
     (void)fi;
     std::string p(path);
-    // parse "/<base>/<frame>"
     std::string rest = p.substr(1);
     auto slash = rest.find('/');
     if (slash == std::string::npos)
@@ -417,9 +442,9 @@ static int fs_read(const char *path,
         return -ENOENT;
     FSContext &ctx = it->second;
 
-    // if it's the wav file, serve the buffer
-    std::string audioName = ctx.baseName + ".wav";
-    if (fname == audioName) {
+    // if it's the wav file, serve the buffer under shared‐lock
+    if (fname == ctx.baseName + ".wav") {
+        std::shared_lock<std::shared_mutex> sl(getMutex(base));
         if ((size_t)offset >= ctx.audioSize)
             return 0;
         size_t tocopy = std::min<size_t>(size, ctx.audioSize - (size_t)offset);
@@ -428,9 +453,13 @@ static int fs_read(const char *path,
     }
 
     // otherwise decode & serve a frame
+    // load_frame will take its own locks
     int err = load_frame(&ctx, fname);
     if (err < 0)
         return err;
+
+    // now read from the cached string under shared‐lock
+    std::shared_lock<std::shared_mutex> sl(getMutex(base));
     auto it2 = ctx.frameCache.find(fname);
     if (it2 == ctx.frameCache.end())
         return -ENOENT;
