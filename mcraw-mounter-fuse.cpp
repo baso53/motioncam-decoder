@@ -29,9 +29,6 @@
 #include <sys/stat.h>   // for mode constants
 #include <cstring>      // for strerror
 #include <cerrno>       // for errno
-#include <mutex>        // NEW: thread-safety
-#include <memory>       // NEW: std::unique_ptr
-#include <array>
 
 #include <motioncam/Decoder.hpp>
 #include <audiofile/AudioFile.h>
@@ -70,7 +67,7 @@ bool getAudio(
 }
 
 struct FSContext {
-    std::unique_ptr<motioncam::Decoder> decoder = nullptr;
+    motioncam::Decoder *decoder = nullptr;
     nlohmann::json containerMetadata;
     std::vector<std::string> filenames;
     std::map<std::string, std::string> frameCache;
@@ -91,69 +88,6 @@ struct FSContext {
     size_t               audioSize = 0;
 
     std::string baseName;
-
-    mutable std::mutex mtx;
-
-    FSContext() = default;
-    FSContext(const FSContext&)            = delete;
-    FSContext& operator=(const FSContext&) = delete;
-
-    FSContext(FSContext&& other) noexcept
-        : decoder(std::move(other.decoder)),
-          containerMetadata(std::move(other.containerMetadata)),
-          filenames(std::move(other.filenames)),
-          frameCache(std::move(other.frameCache)),
-          frameCacheOrder(std::move(other.frameCacheOrder)),
-          frameSize(other.frameSize),
-          frameList(std::move(other.frameList)),
-          blackLevels(std::move(other.blackLevels)),
-          whiteLevel(other.whiteLevel),
-          cfa(other.cfa),
-          orientation(other.orientation),
-          colorMatrix1(std::move(other.colorMatrix1)),
-          colorMatrix2(std::move(other.colorMatrix2)),
-          forwardMatrix1(std::move(other.forwardMatrix1)),
-          forwardMatrix2(std::move(other.forwardMatrix2)),
-          audioWavData(std::move(other.audioWavData)),
-          audioSize(other.audioSize),
-          baseName(std::move(other.baseName))
-    {
-        other.frameSize = 0;
-        other.whiteLevel = 0.0;
-        other.audioSize  = 0;
-    }
-
-    FSContext& operator=(FSContext&& other) noexcept
-    {
-        if (this != &other) {
-            std::lock_guard<std::mutex> lk_this(mtx);
-            std::lock_guard<std::mutex> lk_other(other.mtx);
-
-            decoder           = std::move(other.decoder);
-            containerMetadata = std::move(other.containerMetadata);
-            filenames         = std::move(other.filenames);
-            frameCache        = std::move(other.frameCache);
-            frameCacheOrder   = std::move(other.frameCacheOrder);
-            frameSize         = other.frameSize;
-            frameList         = std::move(other.frameList);
-            blackLevels       = std::move(other.blackLevels);
-            whiteLevel        = other.whiteLevel;
-            cfa               = other.cfa;
-            orientation       = other.orientation;
-            colorMatrix1      = std::move(other.colorMatrix1);
-            colorMatrix2      = std::move(other.colorMatrix2);
-            forwardMatrix1    = std::move(other.forwardMatrix1);
-            forwardMatrix2    = std::move(other.forwardMatrix2);
-            audioWavData      = std::move(other.audioWavData);
-            audioSize         = other.audioSize;
-            baseName          = std::move(other.baseName);
-
-            other.frameSize  = 0;
-            other.whiteLevel = 0.0;
-            other.audioSize  = 0;
-        }
-        return *this;
-    }
 };
 
 static std::map<std::string, FSContext> contexts;
@@ -201,8 +135,6 @@ static std::string frameName(const std::string &base, int i)
 // after writing to cache, if this is the first frame, record its size
 static int load_frame(FSContext *ctx, const std::string &path)
 {
-    std::lock_guard<std::mutex> guard(ctx->mtx);
-
     // fast‐path if cached
     if (ctx->frameCache.count(path))
         return 0;
@@ -354,8 +286,6 @@ static int fs_getattr(const char *path, struct fuse_stat *st)
         return -ENOENT;
     FSContext &ctx = it->second;
 
-    std::lock_guard<std::mutex> lock(ctx.mtx); 
-
     // if they asked for "<base>.wav"
     std::string audioName = ctx.baseName + ".wav";
     if (fname == audioName) {
@@ -406,8 +336,6 @@ static int fs_readdir(const char *path, void *buf,
     if (it == contexts.end())
         return -ENOENT;
     FSContext &ctx = it->second;
-
-    std::lock_guard<std::mutex> lock(ctx.mtx);
 
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
@@ -492,7 +420,6 @@ static int fs_read(const char *path,
     // if it's the wav file, serve the buffer
     std::string audioName = ctx.baseName + ".wav";
     if (fname == audioName) {
-        std::lock_guard<std::mutex> lock(ctx.mtx);
         if ((size_t)offset >= ctx.audioSize)
             return 0;
         size_t tocopy = std::min<size_t>(size, ctx.audioSize - (size_t)offset);
@@ -504,8 +431,6 @@ static int fs_read(const char *path,
     int err = load_frame(&ctx, fname);
     if (err < 0)
         return err;
-
-    std::lock_guard<std::mutex> lock(ctx.mtx);
     auto it2 = ctx.frameCache.find(fname);
     if (it2 == ctx.frameCache.end())
         return -ENOENT;
@@ -555,7 +480,7 @@ int main(int argc, char *argv[])
             ctx.baseName = baseName;
             try {
                 // pass the absolute path into the decoder
-                ctx.decoder = std::make_unique<motioncam::Decoder>(fullPath);
+                ctx.decoder = new motioncam::Decoder(fullPath);
             }
             catch (std::exception &e) {
                 std::cerr << "Decoder error (" << fullPath << "): "
@@ -608,7 +533,7 @@ int main(int argc, char *argv[])
             }
             // ------------------------------------------------------------------
 
-            // stash context under the base name (moved, not copied)
+            // stash context under the base name
             contexts.emplace(baseName, std::move(ctx));
         }
     }
@@ -636,7 +561,7 @@ int main(int argc, char *argv[])
     }
     #endif
 
-    // 4) assemble the FUSE flags/options
+    // 4) assemble the same FUSE flags/options as original
     std::string volname = fs::path(mountPoint).filename().string();
     std::string mountOptions =
         "iosize=8388608,"
@@ -646,14 +571,15 @@ int main(int argc, char *argv[])
         "noapplexattr,"
         "volname=" + volname;
 
-    int fuse_argc = 5;
-    char *fuse_argv[6];
+    int fuse_argc = 6;
+    char *fuse_argv[7];
     fuse_argv[0] = argv[0];
-    fuse_argv[1] = (char*)"-f";          // foreground
-    fuse_argv[2] = (char*)"-o";          // mount options
-    fuse_argv[3] = (char*)mountOptions.c_str();
-    fuse_argv[4] = (char*)mountPoint.c_str();
-    fuse_argv[5] = nullptr;
+    fuse_argv[1] = (char*)"-f";  // foreground
+    fuse_argv[2] = (char*)"-s";  // single-threaded
+    fuse_argv[3] = (char*)"-o";  // mount options
+    fuse_argv[4] = (char*)mountOptions.c_str();
+    fuse_argv[5] = (char*)mountPoint.c_str();
+    fuse_argv[6] = nullptr;
 
     // 5) run FUSE
     int ret = fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
