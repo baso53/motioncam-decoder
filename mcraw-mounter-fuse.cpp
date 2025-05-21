@@ -25,15 +25,13 @@
 #include <sstream>
 #include <iostream>
 #include <cmath>
-#include <unistd.h>
-#include <sys/statvfs.h>
-#include <cstring>    // for strdup, strerror
-#include <libgen.h>   // for dirname(), basename()
-#include <sys/stat.h> // for mkdir
-#include <errno.h>
-#include <dirent.h>   // for scanning directory
-#include <limits.h>   // for PATH_MAX
-#include <mach-o/dyld.h> // For _NSGetExecutablePath
+#include <filesystem>   // C++17 filesystem for cross-platform directory and path handling
+#include <sys/stat.h>   // for mode constants
+#include <cstring>      // for strerror
+#include <cerrno>       // for errno
+#include <mutex>        // NEW: thread-safety
+#include <memory>       // NEW: std::unique_ptr
+#include <array>
 
 #include <motioncam/Decoder.hpp>
 #include <audiofile/AudioFile.h>
@@ -72,7 +70,7 @@ bool getAudio(
 }
 
 struct FSContext {
-    motioncam::Decoder *decoder = nullptr;
+    std::unique_ptr<motioncam::Decoder> decoder = nullptr;
     nlohmann::json containerMetadata;
     std::vector<std::string> filenames;
     std::map<std::string, std::string> frameCache;
@@ -93,6 +91,69 @@ struct FSContext {
     size_t               audioSize = 0;
 
     std::string baseName;
+
+    mutable std::mutex mtx;
+
+    FSContext() = default;
+    FSContext(const FSContext&)            = delete;
+    FSContext& operator=(const FSContext&) = delete;
+
+    FSContext(FSContext&& other) noexcept
+        : decoder(std::move(other.decoder)),
+          containerMetadata(std::move(other.containerMetadata)),
+          filenames(std::move(other.filenames)),
+          frameCache(std::move(other.frameCache)),
+          frameCacheOrder(std::move(other.frameCacheOrder)),
+          frameSize(other.frameSize),
+          frameList(std::move(other.frameList)),
+          blackLevels(std::move(other.blackLevels)),
+          whiteLevel(other.whiteLevel),
+          cfa(other.cfa),
+          orientation(other.orientation),
+          colorMatrix1(std::move(other.colorMatrix1)),
+          colorMatrix2(std::move(other.colorMatrix2)),
+          forwardMatrix1(std::move(other.forwardMatrix1)),
+          forwardMatrix2(std::move(other.forwardMatrix2)),
+          audioWavData(std::move(other.audioWavData)),
+          audioSize(other.audioSize),
+          baseName(std::move(other.baseName))
+    {
+        other.frameSize = 0;
+        other.whiteLevel = 0.0;
+        other.audioSize  = 0;
+    }
+
+    FSContext& operator=(FSContext&& other) noexcept
+    {
+        if (this != &other) {
+            std::lock_guard<std::mutex> lk_this(mtx);
+            std::lock_guard<std::mutex> lk_other(other.mtx);
+
+            decoder           = std::move(other.decoder);
+            containerMetadata = std::move(other.containerMetadata);
+            filenames         = std::move(other.filenames);
+            frameCache        = std::move(other.frameCache);
+            frameCacheOrder   = std::move(other.frameCacheOrder);
+            frameSize         = other.frameSize;
+            frameList         = std::move(other.frameList);
+            blackLevels       = std::move(other.blackLevels);
+            whiteLevel        = other.whiteLevel;
+            cfa               = other.cfa;
+            orientation       = other.orientation;
+            colorMatrix1      = std::move(other.colorMatrix1);
+            colorMatrix2      = std::move(other.colorMatrix2);
+            forwardMatrix1    = std::move(other.forwardMatrix1);
+            forwardMatrix2    = std::move(other.forwardMatrix2);
+            audioWavData      = std::move(other.audioWavData);
+            audioSize         = other.audioSize;
+            baseName          = std::move(other.baseName);
+
+            other.frameSize  = 0;
+            other.whiteLevel = 0.0;
+            other.audioSize  = 0;
+        }
+        return *this;
+    }
 };
 
 static std::map<std::string, FSContext> contexts;
@@ -131,7 +192,7 @@ static void cache_container_metadata(FSContext *ctx)
 
 static std::string frameName(const std::string &base, int i)
 {
-    char buf[PATH_MAX];
+    char buf[200];
     std::snprintf(buf, sizeof(buf), "%s_%06d.dng", base.c_str(), i);
     return buf;
 }
@@ -140,6 +201,8 @@ static std::string frameName(const std::string &base, int i)
 // after writing to cache, if this is the first frame, record its size
 static int load_frame(FSContext *ctx, const std::string &path)
 {
+    std::lock_guard<std::mutex> guard(ctx->mtx);
+
     // fast‐path if cached
     if (ctx->frameCache.count(path))
         return 0;
@@ -252,7 +315,11 @@ static int load_frame(FSContext *ctx, const std::string &path)
 }
 
 // report uniform size (0 until we have it)
+#ifdef __APPLE__
 static int fs_getattr(const char *path, struct stat *st)
+#else
+static int fs_getattr(const char *path, struct fuse_stat *st)
+#endif
 {
     // path == "/"                -> root
     // path == "/<base>"          -> directory for each mcraw
@@ -287,6 +354,8 @@ static int fs_getattr(const char *path, struct stat *st)
         return -ENOENT;
     FSContext &ctx = it->second;
 
+    std::lock_guard<std::mutex> lock(ctx.mtx); 
+
     // if they asked for "<base>.wav"
     std::string audioName = ctx.baseName + ".wav";
     if (fname == audioName) {
@@ -308,9 +377,15 @@ static int fs_getattr(const char *path, struct stat *st)
     return 0;
 }
 
+#ifdef __APPLE__
 static int fs_readdir(const char *path, void *buf,
                       fuse_fill_dir_t filler,
                       off_t offset, struct fuse_file_info *fi)
+#else
+static int fs_readdir(const char *path, void *buf,
+                      fuse_fill_dir_t filler,
+                      fuse_off_t offset, struct fuse_file_info *fi)
+#endif
 {
     std::string p(path);
     (void)offset; (void)fi;
@@ -332,6 +407,8 @@ static int fs_readdir(const char *path, void *buf,
         return -ENOENT;
     FSContext &ctx = it->second;
 
+    std::lock_guard<std::mutex> lock(ctx.mtx);
+
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
 
@@ -350,6 +427,9 @@ static int fs_readdir(const char *path, void *buf,
 
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
+    #ifndef O_RDONLY // expose for non-POSIX (in other words, Windows)
+    # define O_RDONLY 0
+    #endif
     std::string p(path);
     // must be /<base>/<frame>
     if (p.size() < 2 || p[0] != '/')
@@ -380,11 +460,19 @@ static int fs_open(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
+#ifdef __APPLE__
 static int fs_read(const char *path,
                    char *buf,
                    size_t size,
                    off_t offset,
                    struct fuse_file_info *fi)
+#else
+static int fs_read(const char *path,
+                   char *buf,
+                   size_t size,
+                   fuse_off_t offset,
+                   struct fuse_file_info *fi)
+#endif
 {
     (void)fi;
     std::string p(path);
@@ -404,17 +492,20 @@ static int fs_read(const char *path,
     // if it's the wav file, serve the buffer
     std::string audioName = ctx.baseName + ".wav";
     if (fname == audioName) {
+        std::lock_guard<std::mutex> lock(ctx.mtx);
         if ((size_t)offset >= ctx.audioSize)
             return 0;
         size_t tocopy = std::min<size_t>(size, ctx.audioSize - (size_t)offset);
         memcpy(buf, ctx.audioWavData.data() + offset, tocopy);
-        return (ssize_t)tocopy;
+        return tocopy;
     }
 
     // otherwise decode & serve a frame
     int err = load_frame(&ctx, fname);
     if (err < 0)
         return err;
+
+    std::lock_guard<std::mutex> lock(ctx.mtx);
     auto it2 = ctx.frameCache.find(fname);
     if (it2 == ctx.frameCache.end())
         return -ENOENT;
@@ -423,14 +514,14 @@ static int fs_read(const char *path,
         return 0;
     size_t tocopy = std::min<size_t>(size, data.size() - (size_t)offset);
     memcpy(buf, data.data() + offset, tocopy);
-    return (ssize_t)tocopy;
+    return tocopy;
 }
 
 static struct fuse_operations fs_ops = {
     .getattr = fs_getattr,
-    .readdir = fs_readdir,
     .open    = fs_open,
     .read    = fs_read,
+    .readdir = fs_readdir,
 };
 
 int main(int argc, char *argv[])
@@ -441,31 +532,22 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // 1) figure out our own executable's directory
-    char exePath[PATH_MAX];
-    uint32_t size = sizeof(exePath);
-    if (_NSGetExecutablePath(exePath, &size) != 0) {
-        fprintf(stderr, "Executable path too long\n");
-        exit(1);
-    }
-    // dirname() may modify its argument
-    std::string appDir = dirname(exePath);
+    namespace fs = std::filesystem;
+
+    // 1) figure out our own executable's directory via argv[0]
+    fs::path exePath = fs::weakly_canonical(argv[0]);
+    std::string appDir = exePath.parent_path().string();
 
     // 2) scan that directory for *.mcraw files
-    DIR *d = opendir(appDir.c_str());
-    if (!d) {
-        std::cerr << "Error: cannot open directory " << appDir << "\n";
-        return 1;
-    }
-
-    struct dirent *ent;
-    while ((ent = readdir(d)) != nullptr) {
-        std::string fn = ent->d_name;
-        // only care about files ending in ".mcraw"
-        if (fn.size() > 6 && fn.compare(fn.size()-6, 6, ".mcraw") == 0) {
-            // build full absolute path
-            std::string fullPath = appDir + "/" + fn;
-            std::string baseName = fn.substr(0, fn.size()-6);
+    try {
+        for (auto const& entry : fs::directory_iterator(appDir)) {
+            if (!entry.is_regular_file())
+                continue;
+            if (entry.path().extension() != ".mcraw")
+                continue;
+            std::string fn = entry.path().filename().string();
+            std::string fullPath = entry.path().string();
+            std::string baseName = entry.path().stem().string();
 
             std::cout << "Found file: " << fullPath << "\n";
 
@@ -473,7 +555,7 @@ int main(int argc, char *argv[])
             ctx.baseName = baseName;
             try {
                 // pass the absolute path into the decoder
-                ctx.decoder = new motioncam::Decoder(fullPath);
+                ctx.decoder = std::make_unique<motioncam::Decoder>(fullPath);
             }
             catch (std::exception &e) {
                 std::cerr << "Decoder error (" << fullPath << "): "
@@ -510,7 +592,7 @@ int main(int argc, char *argv[])
                 int sampleRate  = ctx.decoder->audioSampleRateHz();
                 int numChannels = ctx.decoder->numAudioChannels();
 
-                auto wavBytes = getAudio(
+                getAudio(
                     fileData,
                     sampleRate,
                     numChannels,
@@ -526,11 +608,14 @@ int main(int argc, char *argv[])
             }
             // ------------------------------------------------------------------
 
-            // stash context under the base name
+            // stash context under the base name (moved, not copied)
             contexts.emplace(baseName, std::move(ctx));
         }
     }
-    closedir(d);
+    catch (std::exception &e) {
+        std::cerr << "Directory scan error: " << e.what() << "\n";
+        return 1;
+    }
 
     if (contexts.empty()) {
         std::cerr << "No .mcraw files found in " << appDir << "\n";
@@ -539,14 +624,20 @@ int main(int argc, char *argv[])
 
     // 3) ensure the mount‐point exists
     std::string mountPoint = appDir + "/mcraws";
-    if (::mkdir(mountPoint.c_str(), 0755) != 0 && errno != EEXIST) {
+    #ifdef __APPLE__
+    try {
+        if (!fs::exists(mountPoint))
+            fs::create_directory(mountPoint);
+        }
+        catch (std::exception &e) {
         std::cerr << "Error creating mountpoint '" << mountPoint
-             << "': " << strerror(errno) << "\n";
+        << "': " << e.what() << "\n";
         return 1;
     }
+    #endif
 
-    // 3) assemble the same FUSE flags/options as original
-    std::string volname = mountPoint.substr(mountPoint.find_last_of('/') + 1);
+    // 4) assemble the FUSE flags/options
+    std::string volname = fs::path(mountPoint).filename().string();
     std::string mountOptions =
         "iosize=8388608,"
         "noappledouble,"
@@ -555,23 +646,26 @@ int main(int argc, char *argv[])
         "noapplexattr,"
         "volname=" + volname;
 
-    int fuse_argc = 6;
-    char *fuse_argv[7];
+    int fuse_argc = 5;
+    char *fuse_argv[6];
     fuse_argv[0] = argv[0];
-    fuse_argv[1] = (char*)"-f";  // foreground
-    fuse_argv[2] = (char*)"-s";  // single-threaded
-    fuse_argv[3] = (char*)"-o";  // mount options
-    fuse_argv[4] = (char*)mountOptions.c_str();
-    fuse_argv[5] = (char*)mountPoint.c_str();
-    fuse_argv[6] = nullptr;
+    fuse_argv[1] = (char*)"-f";          // foreground
+    fuse_argv[2] = (char*)"-o";          // mount options
+    fuse_argv[3] = (char*)mountOptions.c_str();
+    fuse_argv[4] = (char*)mountPoint.c_str();
+    fuse_argv[5] = nullptr;
 
-    // 4) run FUSE
+    // 5) run FUSE
     int ret = fuse_main(fuse_argc, fuse_argv, &fs_ops, nullptr);
 
     std::cout << "Exit code: " << ret;
-    if (::rmdir(mountPoint.c_str()) != 0)
-        std::cerr << "cleanup_mount: rmdir(\"" << mountPoint
-              << "\") failed: " << strerror(errno) << "\n";
+    try {
+        if (fs::exists(mountPoint))
+            fs::remove(mountPoint);
+    }
+    catch (...) {
+        std::cerr << "cleanup_mount: cannot remove '" << mountPoint << "'\n";
+    }
 
     return ret;
 }

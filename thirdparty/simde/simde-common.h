@@ -39,6 +39,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <cmath>
 
 #include "simde-detect-clang.h"
 #include "simde-arch.h"
